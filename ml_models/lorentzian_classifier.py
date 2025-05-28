@@ -1,12 +1,11 @@
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-# Для примера, будем использовать простой KNeighborsClassifier,
-# в реальности здесь должен быть ваш Lorentzian Classifier
-from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import accuracy_score
+from typing import Optional, Tuple
+import joblib
+import os
 
 from logger_setup import get_logger
 
@@ -14,228 +13,364 @@ logger = get_logger(__name__)
 
 
 class LorentzianClassifier(BaseEstimator, ClassifierMixin):
-  def __init__(self, n_neighbors=5, **kwargs):  # Параметры для вашего классификатора
-    # Если бы это был настоящий Lorentzian, здесь были бы его параметры
-    self.n_neighbors = n_neighbors
-    # Пример: используем KNN как временную замену
-    self.model = KNeighborsClassifier(n_neighbors=self.n_neighbors)
-    self.scaler = StandardScaler()  # Масштабирование данных часто полезно
-    self.is_fitted = False
-    logger.info(f"LorentzianClassifier (заглушка с KNN, n_neighbors={n_neighbors}) инициализирован.")
+  """
+  Реализация Lorentzian Classifier для торговых сигналов.
+  Использует Lorentzian distance для классификации.
+  """
 
-  def _prepare_features(self, df: pd.DataFrame) ->[np.ndarray]:
+  def __init__(self, k_neighbors=8, max_lookback=2000, feature_weights=None):
+    self.k_neighbors = k_neighbors
+    self.max_lookback = max_lookback
+    self.feature_weights = feature_weights or {}
+    self.scaler = StandardScaler()
+    self.is_fitted = False
+    self.X_train = None
+    self.y_train = None
+    self.feature_names = None
+
+    logger.info(f"LorentzianClassifier инициализирован с k={k_neighbors}, max_lookback={max_lookback}")
+
+  def _lorentzian_distance(self, x1: np.ndarray, x2: np.ndarray) -> float:
+    """
+    Вычисляет Lorentzian расстояние между двумя векторами признаков.
+    Lorentzian distance = sum(log(1 + abs(x1[i] - x2[i])))
+    """
+    if len(x1) != len(x2):
+      raise ValueError("Векторы должны иметь одинаковую размерность")
+
+    # Применяем веса признаков если они заданы
+    weights = np.ones(len(x1))
+    if self.feature_names:
+      for i, feature in enumerate(self.feature_names):
+        if feature in self.feature_weights:
+          weights[i] = self.feature_weights[feature]
+
+    distance = np.sum(weights * np.log1p(np.abs(x1 - x2)))
+    return distance
+
+  def _prepare_features(self, df: pd.DataFrame) -> Tuple[Optional[np.ndarray], Optional[list]]:
     """
     Подготавливает признаки из DataFrame.
-    Предполагается, что df содержит колонки 'feature1', 'feature2', ..., 'rsi'.
-    Это место для feature engineering.
+    Возвращает массив признаков и список их названий.
     """
-    # Пример признаков: RSI, возможно, изменения цены, волатильность и т.д.
-    # ВАЖНО: Набор признаков должен быть тщательно подобран и протестирован.
-    required_features = ['rsi']  # Добавьте сюда другие признаки, которые будет использовать модель
+    # Базовые технические индикаторы
+    feature_columns = []
 
-    if not all(feature in df.columns for feature in required_features):
-      logger.error(
-        f"Отсутствуют необходимые признаки в DataFrame. Требуются: {required_features}, есть: {df.columns.tolist()}")
-      return None
+    # RSI
+    if 'rsi' in df.columns:
+      feature_columns.append('rsi')
 
-    features = df[required_features].copy()
+    # MACD
+    if 'macd' in df.columns:
+      feature_columns.append('macd')
+    if 'macd_signal' in df.columns:
+      feature_columns.append('macd_signal')
+    if 'macd_histogram' in df.columns:
+      feature_columns.append('macd_histogram')
 
-    # Пример: можно добавить разницу RSI, если есть предыдущие значения
-    # features['rsi_diff'] = features['rsi'].diff().fillna(0)
+    # Moving Averages
+    if 'sma_20' in df.columns:
+      feature_columns.append('sma_20')
+    if 'ema_12' in df.columns:
+      feature_columns.append('ema_12')
 
-    # Удаляем строки с NaN, которые могли появиться после feature engineering
-    features.dropna(inplace=True)
-    if features.empty:
-      logger.warning("После подготовки признаков и удаления NaN не осталось данных.")
-      return None
+    # Bollinger Bands
+    if 'bb_upper' in df.columns:
+      feature_columns.append('bb_upper')
+    if 'bb_lower' in df.columns:
+      feature_columns.append('bb_lower')
+    if 'bb_percent' in df.columns:
+      feature_columns.append('bb_percent')
 
-    return features.values
+    # Volatility indicators
+    if 'atr' in df.columns:
+      feature_columns.append('atr')
+    if 'volatility' in df.columns:
+      feature_columns.append('volatility')
+
+    # Price-based features
+    if 'close' in df.columns and 'open' in df.columns:
+      df['price_change_pct'] = (df['close'] - df['open']) / df['open'] * 100
+      feature_columns.append('price_change_pct')
+
+    if 'volume' in df.columns:
+      feature_columns.append('volume')
+
+    if not feature_columns:
+      logger.error("Не найдено подходящих признаков в DataFrame")
+      return None, None
+
+    # Отфильтровываем только существующие колонки
+    available_features = [col for col in feature_columns if col in df.columns]
+
+    if not available_features:
+      logger.error(f"Ни один из требуемых признаков не найден в DataFrame. Доступные колонки: {df.columns.tolist()}")
+      return None, None
+
+    features_df = df[available_features].copy()
+
+    # Удаляем NaN значения
+    features_df = features_df.dropna()
+
+    if features_df.empty:
+      logger.warning("После удаления NaN не осталось данных")
+      return None, None
+
+    logger.info(f"Подготовлено {len(available_features)} признаков: {available_features}")
+    return features_df.values, available_features
 
   def fit(self, X_df: pd.DataFrame, y: pd.Series):
     """
-    Обучает модель.
-    X_df: DataFrame с признаками (например, исторические данные со свечами и индикаторами).
-    y: Series с целевой переменной (например, 0 - держать, 1 - купить, -1 (или 2) - продать).
+    Обучает модель на исторических данных.
     """
-    logger.info(f"Начало обучения модели LorentzianClassifier на {len(X_df)} примерах...")
-    X_prepared = self._prepare_features(X_df)
-    if X_prepared is None or X_prepared.shape[0] == 0:
-      logger.error("Не удалось подготовить признаки для обучения. Обучение прервано.")
+    logger.info(f"Начало обучения LorentzianClassifier на {len(X_df)} примерах...")
+
+    X_prepared, feature_names = self._prepare_features(X_df)
+    if X_prepared is None:
+      logger.error("Не удалось подготовить признаки для обучения")
       return self
 
-    # Убедимся, что y соответствует X_prepared по количеству строк
-    if len(y) != X_prepared.shape[0]:
-      # Это может произойти, если в X_df были NaN, которые удалили в _prepare_features,
-      # а y не был соответствующим образом отфильтрован.
-      # Нужно синхронизировать y с индексами X_df ПОСЛЕ dropna в _prepare_features.
-      # Для простоты примера, предполагаем, что y уже выровнен.
-      # В реальном коде: y = y[X_df.index.isin(features.index)] где features - это DataFrame до .values
-      logger.warning(
-        f"Размерности X_prepared ({X_prepared.shape[0]}) и y ({len(y)}) не совпадают после подготовки признаков. Проверьте логику фильтрации NaN.")
-      # Простейший вариант - обрезать y, но это не всегда корректно
-      # y = y.iloc[:X_prepared.shape[0]]
-      # Лучше обеспечить правильное соответствие индексов.
-      # Для примера, если X_prepared был получен из features_df, то y должен быть y[features_df.index]
+    # Синхронизируем y с подготовленными данными
+    valid_indices = X_df.dropna(subset=[col for col in feature_names if col in X_df.columns]).index
+    y_aligned = y.loc[valid_indices]
 
-      # Предполагая, что y пришел из того же DataFrame, что и X_df, и был очищен от NaN аналогично
-      # y = y[X_df.dropna().index] # Пример, если X_df - это исходный DataFrame до выбора колонок
-      # Это сложный момент, требующий аккуратной синхронизации данных.
-      # В данном примере, будем считать, что y уже корректен.
-      # Если X_prepared пуст, то y также должен быть пустым или обучение не должно происходить.
-      pass  # Оставим как есть для простоты, но это ВАЖНО!
+    if len(X_prepared) != len(y_aligned):
+      logger.error(f"Размерности X ({len(X_prepared)}) и y ({len(y_aligned)}) не совпадают")
+      return self
 
+    # Ограничиваем размер обучающей выборки для эффективности
+    if len(X_prepared) > self.max_lookback:
+      X_prepared = X_prepared[-self.max_lookback:]
+      y_aligned = y_aligned.tail(self.max_lookback)
+      logger.info(f"Обучающая выборка ограничена до {self.max_lookback} примеров")
+
+    # Масштабируем признаки
     X_scaled = self.scaler.fit_transform(X_prepared)
 
-    if len(X_scaled) < self.n_neighbors:
-      adjusted_neighbors = max(1, len(X_scaled))
-      self.model = KNeighborsClassifier(n_neighbors=adjusted_neighbors)
-      logger.warning(f"KNN: слишком мало данных для обучения. "
-                     f"n_neighbors уменьшен до {adjusted_neighbors}")
-
-    self.model.fit(X_scaled, y)
+    # Сохраняем обучающие данные
+    self.X_train = X_scaled
+    self.y_train = y_aligned.values
+    self.feature_names = feature_names
     self.is_fitted = True
-    logger.info("Модель LorentzianClassifier успешно обучена.")
+
+    logger.info("Модель LorentzianClassifier успешно обучена")
     return self
 
-  def predict(self, X_df_new: pd.DataFrame) -> [np.ndarray]:
+  def predict(self, X_df_new: pd.DataFrame) -> Optional[np.ndarray]:
     """
     Делает предсказания для новых данных.
-    X_df_new: DataFrame с новыми данными (например, последняя свеча с индикаторами).
-    Возвращает массив предсказаний (0, 1 или -1/2).
-    """
-    if self.model.n_neighbors > self.model._fit_X.shape[0]:
-      logger.error(f"Недостаточно обучающих данных для предсказания. "
-                   f"n_neighbors={self.model.n_neighbors}, обучено на {self.model._fit_X.shape[0]}")
-      return np.array([])
-
-    if not self.is_fitted:
-      logger.error("Модель еще не обучена. Вызовите fit() перед predict().")
-      return None
-
-    logger.debug(f"Получение предсказания для {len(X_df_new)} новых примеров...")
-    X_prepared = self._prepare_features(X_df_new)
-
-    if X_prepared is None or X_prepared.shape[0] == 0:
-      logger.warning("Нет данных для предсказания после подготовки признаков.")
-      return np.array([])  # Возвращаем пустой массив, если нет данных
-
-    X_scaled = self.scaler.transform(X_prepared)  # Используем transform, а не fit_transform
-
-    predictions = self.model.predict(X_scaled)
-    logger.debug(f"Предсказания модели: {predictions}")
-    return predictions
-
-  def predict_proba(self, X_df_new: pd.DataFrame) -> [np.ndarray]:
-    """
-    Делает предсказания вероятностей классов для новых данных.
     """
     if not self.is_fitted:
-      logger.error("Модель еще не обучена. Вызовите fit() перед predict_proba().")
-      return None
-    if not hasattr(self.model, "predict_proba"):
-      logger.warning("Базовая модель (KNN) не поддерживает predict_proba в этой конфигурации или не была обучена.")
+      logger.error("Модель не обучена. Вызовите fit() перед predict()")
       return None
 
-    X_prepared = self._prepare_features(X_df_new)
-    if X_prepared is None or X_prepared.shape[0] == 0:
-      logger.warning("Нет данных для предсказания вероятностей после подготовки признаков.")
+    X_prepared, _ = self._prepare_features(X_df_new)
+    if X_prepared is None:
+      logger.warning("Не удалось подготовить признаки для предсказания")
       return np.array([])
 
     X_scaled = self.scaler.transform(X_prepared)
+    predictions = []
 
-    try:
-      probabilities = self.model.predict_proba(X_scaled)
-      logger.debug(f"Вероятности предсказаний: {probabilities}")
-      return probabilities
-    except Exception as e:
-      logger.error(f"Ошибка при вызове predict_proba: {e}")
+    for x_new in X_scaled:
+      # Вычисляем расстояния до всех обучающих примеров
+      distances = []
+      for i, x_train in enumerate(self.X_train):
+        dist = self._lorentzian_distance(x_new, x_train)
+        distances.append((dist, self.y_train[i]))
+
+      # Сортируем по расстоянию и берем k ближайших соседей
+      distances.sort(key=lambda x: x[0])
+      k_nearest = distances[:self.k_neighbors]
+
+      # Голосование с весами (обратно пропорциональными расстоянию)
+      class_votes = {}
+      for dist, label in k_nearest:
+        weight = 1.0 / (1.0 + dist)  # Вес обратно пропорционален расстоянию
+        if label not in class_votes:
+          class_votes[label] = 0
+        class_votes[label] += weight
+
+      # Выбираем класс с максимальным весом
+      predicted_class = max(class_votes, key=class_votes.get)
+      predictions.append(predicted_class)
+
+    logger.debug(f"Предсказания: {predictions}")
+    return np.array(predictions)
+
+  def predict_proba(self, X_df_new: pd.DataFrame) -> Optional[np.ndarray]:
+    """
+    Возвращает вероятности принадлежности к каждому классу.
+    """
+    if not self.is_fitted:
+      logger.error("Модель не обучена")
       return None
 
+    X_prepared, _ = self._prepare_features(X_df_new)
+    if X_prepared is None:
+      return np.array([])
 
-# Пример обучения и использования (нужны реальные данные)
-def example_train_and_predict_lorentzian():
-  logger.info("--- Пример обучения и использования LorentzianClassifier ---")
-  # 1. Генерация/загрузка обучающих данных (заглушка)
-  # В реальности это будут исторические данные с рассчитанными индикаторами и целевой переменной
-  # Целевая переменная (y): например, 1 если цена выросла на X% через N свечей (покупка),
-  # -1 (или 2) если упала (продажа), 0 если осталась на месте (держать).
-  rng = np.random.RandomState(42)
-  num_samples = 200
-  # Предположим, у нас есть RSI и еще один признак
-  X_train_df = pd.DataFrame({
-    'rsi': rng.randint(10, 90, num_samples),
-    'some_other_feature': rng.rand(num_samples) * 10,
-    # ... другие признаки ...
-  })
-  # Простая логика для целевой переменной (заглушка):
-  # если RSI > 70 -> продать (2), если RSI < 30 -> купить (1), иначе держать (0)
-  y_train_series = pd.Series(np.select(
-    [X_train_df['rsi'] > 70, X_train_df['rsi'] < 30],
-    [2, 1],  # 2 - продать, 1 - купить
-    default=0  # 0 - держать
-  ))
+    X_scaled = self.scaler.transform(X_prepared)
+    probabilities = []
 
-  # Разделение на обучающую и тестовую выборки
-  X_df_train_set, X_df_test_set, y_train_set, y_test_set = train_test_split(
-    X_train_df, y_train_series, test_size=0.2, random_state=42, stratify=y_train_series  # stratify для баланса классов
-  )
-  logger.info(f"Размер обучающей выборки: {len(X_df_train_set)}, тестовой: {len(X_df_test_set)}")
+    # Получаем уникальные классы
+    unique_classes = np.unique(self.y_train)
 
-  # 2. Инициализация и обучение модели
-  ml_model = LorentzianClassifier(n_neighbors=5)  # Используем нашу заглушку
+    for x_new in X_scaled:
+      distances = []
+      for i, x_train in enumerate(self.X_train):
+        dist = self._lorentzian_distance(x_new, x_train)
+        distances.append((dist, self.y_train[i]))
 
-  # Важно: y_train_set должен быть синхронизирован с X_df_train_set после _prepare_features
-  # Если _prepare_features удаляет строки из X_df_train_set, то y_train_set должен быть соответственно отфильтрован.
-  # Для простоты, предположим, что _prepare_features не удаляет строки или y уже соответствует.
-  # В реальном коде:
-  # temp_X_prepared = ml_model._prepare_features(X_df_train_set)
-  # y_train_aligned = y_train_set[X_df_train_set.index.isin(pd.DataFrame(temp_X_prepared, columns=['rsi', '...']).index)] # Сложно и зависит от реализации _prepare_features
-  # ml_model.fit(X_df_train_set, y_train_aligned) # или передавать y_train_set и фильтровать внутри fit
+      distances.sort(key=lambda x: x[0])
+      k_nearest = distances[:self.k_neighbors]
 
-  # Простой вариант: _prepare_features возвращает DataFrame с индексами, и y фильтруется по этим индексам
-  # Сейчас _prepare_features возвращает ndarray, что усложняет синхронизацию y.
-  # Изменим _prepare_features для возврата DataFrame для облегчения. (Не буду сейчас менять, но это важное замечание)
+      # Вычисляем вероятности для каждого класса
+      class_weights = {cls: 0.0 for cls in unique_classes}
+      total_weight = 0.0
 
-  ml_model.fit(X_df_train_set, y_train_set)  # Передаем Series для y
+      for dist, label in k_nearest:
+        weight = 1.0 / (1.0 + dist)
+        class_weights[label] += weight
+        total_weight += weight
 
-  # 3. Предсказание на новых данных (тестовая выборка)
-  if ml_model.is_fitted:
-    predictions = ml_model.predict(X_df_test_set)
-    if predictions is not None and len(predictions) > 0:
-      accuracy = accuracy_score(y_test_set[:len(predictions)],
-                                predictions)  # Срез y_test_set на случай, если predict вернул меньше результатов
-      logger.info(f"Предсказания на тестовой выборке: {predictions}")
-      logger.info(f"Точность (Accuracy) на тестовой выборке: {accuracy:.4f}")
+      # Нормализуем веса до вероятностей
+      class_probs = [class_weights[cls] / total_weight for cls in unique_classes]
+      probabilities.append(class_probs)
 
-      # Пример предсказания вероятностей
-      # probabilities = ml_model.predict_proba(X_df_test_set)
-      # if probabilities is not None:
-      #     logger.info(f"Вероятности для первых 5 тестовых примеров: \n{probabilities[:5]}")
+    return np.array(probabilities)
+
+  def save_model(self, filepath: str):
+    """
+    Сохраняет обученную модель в файл.
+    """
+    if not self.is_fitted:
+      logger.error("Нельзя сохранить необученную модель")
+      return False
+
+    try:
+      model_data = {
+        'X_train': self.X_train,
+        'y_train': self.y_train,
+        'scaler': self.scaler,
+        'feature_names': self.feature_names,
+        'k_neighbors': self.k_neighbors,
+        'max_lookback': self.max_lookback,
+        'feature_weights': self.feature_weights,
+        'is_fitted': self.is_fitted
+      }
+      joblib.dump(model_data, filepath)
+      logger.info(f"Модель сохранена в {filepath}")
+      return True
+    except Exception as e:
+      logger.error(f"Ошибка при сохранении модели: {e}")
+      return False
+
+  def load_model(self, filepath: str):
+    """
+    Загружает обученную модель из файла.
+    """
+    if not os.path.exists(filepath):
+      logger.error(f"Файл модели не найден: {filepath}")
+      return False
+
+    try:
+      model_data = joblib.load(filepath)
+      self.X_train = model_data['X_train']
+      self.y_train = model_data['y_train']
+      self.scaler = model_data['scaler']
+      self.feature_names = model_data['feature_names']
+      self.k_neighbors = model_data['k_neighbors']
+      self.max_lookback = model_data['max_lookback']
+      self.feature_weights = model_data['feature_weights']
+      self.is_fitted = model_data['is_fitted']
+
+      logger.info(f"Модель загружена из {filepath}")
+      return True
+    except Exception as e:
+      logger.error(f"Ошибка при загрузке модели: {e}")
+      return False
+
+
+def create_training_labels(df: pd.DataFrame,
+                           future_bars: int = 5,
+                           profit_threshold: float = 0.01) -> pd.Series:
+  """
+  Создает метки для обучения на основе будущих движений цены.
+
+  Args:
+      df: DataFrame с данными OHLCV
+      future_bars: Количество баров в будущее для анализа
+      profit_threshold: Порог прибыли для генерации сигналов (в долях)
+
+  Returns:
+      Series с метками: 0 - держать, 1 - покупать, 2 - продавать
+  """
+  labels = []
+
+  for i in range(len(df)):
+    if i + future_bars >= len(df):
+      # Для последних баров ставим "держать"
+      labels.append(0)
+      continue
+
+    current_price = df.iloc[i]['close']
+    future_prices = df.iloc[i + 1:i + future_bars + 1]['close']
+
+    max_future_price = future_prices.max()
+    min_future_price = future_prices.min()
+
+    # Вычисляем потенциальную прибыль/убыток
+    upside_potential = (max_future_price - current_price) / current_price
+    downside_risk = (current_price - min_future_price) / current_price
+
+    if upside_potential > profit_threshold and upside_potential > downside_risk:
+      labels.append(1)  # BUY
+    elif downside_risk > profit_threshold and downside_risk > upside_potential:
+      labels.append(2)  # SELL
     else:
-      logger.warning("Предсказания на тестовой выборке не были получены.")
-  else:
-    logger.error("Модель не была обучена, предсказание невозможно.")
+      labels.append(0)  # HOLD
 
-  # 4. Предсказание для одного нового примера (как это будет в боте)
-  # Допустим, это последние данные для символа
-  last_data_point_df = pd.DataFrame({
-    'rsi': [25],  # Пример: RSI в зоне перепроданности
-    'some_other_feature': [5.0]
-    # ... другие признаки ...
-  }, index=[pd.Timestamp.now()])  # DataFrame с одной строкой
-
-  if ml_model.is_fitted:
-    single_prediction = ml_model.predict(last_data_point_df)
-    if single_prediction is not None and len(single_prediction) > 0:
-      logger.info(
-        f"Предсказание для одной точки данных ({last_data_point_df.iloc[0].to_dict()}): Сигнал={single_prediction[0]}")
-      # Сигнал: 0 - держать, 1 - купить, 2 - продать (согласно нашей заглушке y)
-    else:
-      logger.warning("Предсказание для одной точки не было получено.")
+  return pd.Series(labels, index=df.index)
 
 
+# Пример использования
 if __name__ == '__main__':
   from logger_setup import setup_logging
 
   setup_logging("INFO")
-  example_train_and_predict_lorentzian()
+
+  # Генерируем тестовые данные
+  np.random.seed(42)
+  n_samples = 1000
+
+  test_data = pd.DataFrame({
+    'close': np.cumsum(np.random.randn(n_samples) * 0.01) + 100,
+    'volume': np.random.randint(1000, 10000, n_samples),
+    'rsi': np.random.randint(20, 80, n_samples),
+    'macd': np.random.randn(n_samples) * 0.1,
+    'atr': np.random.rand(n_samples) * 2 + 0.5
+  })
+
+  # Создаем метки для обучения
+  y_labels = create_training_labels(test_data, future_bars=5, profit_threshold=0.02)
+
+  # Разделяем на обучающую и тестовую выборки
+  split_idx = int(0.8 * len(test_data))
+  X_train = test_data[:split_idx]
+  y_train = y_labels[:split_idx]
+  X_test = test_data[split_idx:]
+  y_test = y_labels[split_idx:]
+
+  # Обучаем модель
+  model = LorentzianClassifier(k_neighbors=8)
+  model.fit(X_train, y_train)
+
+  # Делаем предсказания
+  predictions = model.predict(X_test)
+  if predictions is not None and len(predictions) > 0:
+    accuracy = accuracy_score(y_test[:len(predictions)], predictions)
+    logger.info(f"Точность модели: {accuracy:.4f}")
+
+    # Сохраняем модель
+    model.save_model("trained_lorentzian_model.pkl")
