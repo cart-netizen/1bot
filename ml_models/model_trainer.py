@@ -8,11 +8,15 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import asyncio
+import joblib
+from datetime import datetime
+import warnings
 
 from ml_models.lorentzian_classifier import LorentzianClassifier, create_training_labels
 from logger_setup import get_logger
 
 logger = get_logger(__name__)
+warnings.filterwarnings('ignore')
 
 
 class ModelTrainer:
@@ -20,8 +24,10 @@ class ModelTrainer:
   Класс для обучения и валидации ML моделей для торговых стратегий.
   """
 
-  def __init__(self, data_path: Optional[str] = None):
+  def __init__(self, data_path: Optional[str] = None, models_dir: str = "trained_models"):
     self.data_path = data_path
+    self.models_dir = Path(models_dir)
+    self.models_dir.mkdir(exist_ok=True)
     self.models = {}
     self.training_history = []
 
@@ -237,4 +243,406 @@ class ModelTrainer:
 
     logger.info("Начало обучения Lorentzian модели...")
 
-    # Подготавливаем
+    # Подготавливаем данные
+    X, y = self.create_features_and_labels(df)
+
+    if X.empty or y.empty:
+      logger.error("Не удалось создать обучающие данные")
+      return {'success': False, 'error': 'No training data created'}
+
+    # Создаем модель
+    model = LorentzianClassifier(**model_params)
+
+    results = {}
+
+    try:
+      if validation_method == 'simple':
+        results = self._simple_validation(model, X, y, test_size)
+      elif validation_method == 'time_series':
+        results = self._time_series_validation(model, X, y, test_size)
+      elif validation_method == 'cross_val':
+        results = self._cross_validation(model, X, y)
+      else:
+        logger.error(f"Неизвестный метод валидации: {validation_method}")
+        return {'success': False, 'error': f'Unknown validation method: {validation_method}'}
+
+      # Сохраняем лучшую модель
+      if results.get('success', False):
+        model_name = f"lorentzian_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        model_path = self.models_dir / f"{model_name}.pkl"
+
+        if results['final_model'].save_model(str(model_path)):
+          results['model_path'] = str(model_path)
+          results['model_name'] = model_name
+          self.models[model_name] = results['final_model']
+
+          # Сохраняем историю обучения
+          training_record = {
+            'timestamp': datetime.now(),
+            'model_type': 'LorentzianClassifier',
+            'model_name': model_name,
+            'params': model_params,
+            'validation_method': validation_method,
+            'metrics': results.get('metrics', {})
+          }
+          self.training_history.append(training_record)
+
+          logger.info(f"Модель {model_name} успешно обучена и сохранена")
+
+    except Exception as e:
+      logger.error(f"Ошибка при обучении модели: {e}")
+      results = {'success': False, 'error': str(e)}
+
+    return results
+
+  def _simple_validation(self, model: LorentzianClassifier, X: pd.DataFrame, y: pd.Series, test_size: float) -> Dict:
+    """
+    Простая валидация с разделением на train/test.
+    """
+    logger.info("Выполняется простая валидация...")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+      X, y, test_size=test_size, random_state=42, stratify=y
+    )
+
+    # Обучаем модель
+    model.fit(X_train, y_train)
+
+    # Предсказания
+    y_pred = model.predict(X_test)
+
+    if y_pred is None:
+      return {'success': False, 'error': 'Model prediction failed'}
+
+    # Метрики
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, output_dict=True)
+    conf_matrix = confusion_matrix(y_test, y_pred)
+
+    logger.info(f"Точность модели: {accuracy:.4f}")
+
+    return {
+      'success': True,
+      'final_model': model,
+      'metrics': {
+        'accuracy': accuracy,
+        'classification_report': report,
+        'confusion_matrix': conf_matrix.tolist(),
+        'train_size': len(X_train),
+        'test_size': len(X_test)
+      }
+    }
+
+  def _time_series_validation(self, model: LorentzianClassifier, X: pd.DataFrame, y: pd.Series,
+                              test_size: float) -> Dict:
+    """
+    Валидация с учетом временной структуры данных.
+    """
+    logger.info("Выполняется временная валидация...")
+
+    # Разделяем по времени (последние данные для теста)
+    split_idx = int(len(X) * (1 - test_size))
+    X_train = X.iloc[:split_idx]
+    X_test = X.iloc[split_idx:]
+    y_train = y.iloc[:split_idx]
+    y_test = y.iloc[split_idx:]
+
+    # Обучаем модель
+    model.fit(X_train, y_train)
+
+    # Предсказания на тестовой выборке
+    y_pred = model.predict(X_test)
+
+    if y_pred is None:
+      return {'success': False, 'error': 'Model prediction failed'}
+
+    # Метрики
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, output_dict=True)
+    conf_matrix = confusion_matrix(y_test, y_pred)
+
+    # Дополнительная оценка стабильности во времени
+    stability_scores = self._calculate_stability_scores(model, X_test, y_test)
+
+    logger.info(f"Точность временной валидации: {accuracy:.4f}")
+
+    return {
+      'success': True,
+      'final_model': model,
+      'metrics': {
+        'accuracy': accuracy,
+        'classification_report': report,
+        'confusion_matrix': conf_matrix.tolist(),
+        'stability_scores': stability_scores,
+        'train_size': len(X_train),
+        'test_size': len(X_test)
+      }
+    }
+
+  def _cross_validation(self, model: LorentzianClassifier, X: pd.DataFrame, y: pd.Series, n_splits: int = 5) -> Dict:
+    """
+    Кросс-валидация с TimeSeriesSplit.
+    """
+    logger.info(f"Выполняется кросс-валидация с {n_splits} фолдами...")
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    scores = []
+    best_model = None
+    best_score = 0
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+      logger.info(f"Обработка фолда {fold + 1}/{n_splits}")
+
+      X_train_fold = X.iloc[train_idx]
+      X_test_fold = X.iloc[test_idx]
+      y_train_fold = y.iloc[train_idx]
+      y_test_fold = y.iloc[test_idx]
+
+      # Создаем новую модель для каждого фолда
+      fold_model = LorentzianClassifier(
+        k_neighbors=model.k_neighbors,
+        max_lookback=model.max_lookback,
+        feature_weights=model.feature_weights
+      )
+
+      fold_model.fit(X_train_fold, y_train_fold)
+      y_pred = fold_model.predict(X_test_fold)
+
+      if y_pred is not None:
+        score = accuracy_score(y_test_fold, y_pred)
+        scores.append(score)
+
+        # Сохраняем лучшую модель
+        if score > best_score:
+          best_score = score
+          best_model = fold_model
+
+        logger.info(f"Фолд {fold + 1} точность: {score:.4f}")
+
+    if not scores:
+      return {'success': False, 'error': 'Cross-validation failed'}
+
+    mean_score = np.mean(scores)
+    std_score = np.std(scores)
+
+    logger.info(f"Средняя точность кросс-валидации: {mean_score:.4f} ± {std_score:.4f}")
+
+    return {
+      'success': True,
+      'final_model': best_model,
+      'metrics': {
+        'cv_scores': scores,
+        'mean_cv_score': mean_score,
+        'std_cv_score': std_score,
+        'best_fold_score': best_score,
+        'total_samples': len(X)
+      }
+    }
+
+  def _calculate_stability_scores(self, model: LorentzianClassifier, X_test: pd.DataFrame, y_test: pd.Series) -> Dict:
+    """
+    Рассчитывает метрики стабильности модели во времени.
+    """
+    window_size = len(X_test) // 5  # Разбиваем на 5 окон
+    stability_scores = []
+
+    for i in range(0, len(X_test) - window_size, window_size):
+      window_X = X_test.iloc[i:i + window_size]
+      window_y = y_test.iloc[i:i + window_size]
+
+      y_pred = model.predict(window_X)
+      if y_pred is not None and len(y_pred) > 0:
+        score = accuracy_score(window_y, y_pred)
+        stability_scores.append(score)
+
+    if stability_scores:
+      return {
+        'window_scores': stability_scores,
+        'stability_mean': np.mean(stability_scores),
+        'stability_std': np.std(stability_scores),
+        'stability_min': np.min(stability_scores),
+        'stability_max': np.max(stability_scores)
+      }
+    else:
+      return {'error': 'Could not calculate stability scores'}
+
+  def evaluate_model_performance(self, model_name: str, test_data: pd.DataFrame) -> Optional[Dict]:
+    """
+    Оценивает производительность обученной модели на новых данных.
+    """
+    if model_name not in self.models:
+      logger.error(f"Модель {model_name} не найдена")
+      return None
+
+    model = self.models[model_name]
+
+    # Подготавливаем тестовые данные
+    X_test, y_test = self.create_features_and_labels(test_data)
+
+    if X_test.empty:
+      logger.error("Не удалось подготовить тестовые данные")
+      return None
+
+    # Предсказания
+    y_pred = model.predict(X_test)
+    if y_pred is None:
+      logger.error("Модель не смогла сделать предсказания")
+      return None
+
+    # Метрики
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, output_dict=True)
+
+    logger.info(f"Производительность модели {model_name}: точность = {accuracy:.4f}")
+
+    return {
+      'model_name': model_name,
+      'accuracy': accuracy,
+      'classification_report': report,
+      'predictions': y_pred.tolist(),
+      'actual': y_test.values.tolist()
+    }
+
+  def load_trained_model(self, model_path: str, model_name: Optional[str] = None) -> bool:
+    """
+    Загружает обученную модель из файла.
+    """
+    if not Path(model_path).exists():
+      logger.error(f"Файл модели не найден: {model_path}")
+      return False
+
+    try:
+      model = LorentzianClassifier()
+      if model.load_model(model_path):
+        name = model_name or Path(model_path).stem
+        self.models[name] = model
+        logger.info(f"Модель {name} успешно загружена")
+        return True
+    except Exception as e:
+      logger.error(f"Ошибка при загрузке модели: {e}")
+
+    return False
+
+  def get_available_models(self) -> List[str]:
+    """
+    Возвращает список доступных обученных моделей.
+    """
+    return list(self.models.keys())
+
+  def get_training_history(self) -> List[Dict]:
+    """
+    Возвращает историю обучения моделей.
+    """
+    return self.training_history
+
+  def create_model_report(self, model_name: str) -> Optional[str]:
+    """
+    Создает отчет о модели.
+    """
+    if model_name not in self.models:
+      logger.error(f"Модель {model_name} не найдена")
+      return None
+
+    # Найдем запись в истории обучения
+    training_record = None
+    for record in self.training_history:
+      if record['model_name'] == model_name:
+        training_record = record
+        break
+
+    if not training_record:
+      return f"Модель {model_name} загружена, но нет записи об обучении"
+
+    report = f"""
+Отчет о модели: {model_name}
+{'=' * 50}
+
+Дата обучения: {training_record['timestamp']}
+Тип модели: {training_record['model_type']}
+Метод валидации: {training_record['validation_method']}
+
+Параметры модели:
+{self._format_dict(training_record['params'])}
+
+Метрики производительности:
+{self._format_dict(training_record['metrics'])}
+        """
+
+    return report.strip()
+
+  def _format_dict(self, d: Dict, indent: int = 2) -> str:
+    """
+    Форматирует словарь для красивого вывода.
+    """
+    lines = []
+    for key, value in d.items():
+      if isinstance(value, dict):
+        lines.append(f"{' ' * indent}{key}:")
+        lines.append(self._format_dict(value, indent + 2))
+      elif isinstance(value, list):
+        lines.append(f"{' ' * indent}{key}: {len(value)} элементов")
+      else:
+        lines.append(f"{' ' * indent}{key}: {value}")
+    return '\n'.join(lines)
+
+  def cleanup_old_models(self, keep_latest: int = 5):
+    """
+    Удаляет старые файлы моделей, оставляя только последние.
+    """
+    model_files = list(self.models_dir.glob("*.pkl"))
+    if len(model_files) <= keep_latest:
+      return
+
+    # Сортируем по времени создания
+    model_files.sort(key=lambda x: x.stat().st_ctime, reverse=True)
+
+    # Удаляем старые файлы
+    for model_file in model_files[keep_latest:]:
+      try:
+        model_file.unlink()
+        logger.info(f"Удален старый файл модели: {model_file}")
+      except Exception as e:
+        logger.error(f"Ошибка при удалении файла {model_file}: {e}")
+
+
+# Пример использования
+if __name__ == '__main__':
+  from logger_setup import setup_logging
+  import os
+
+  setup_logging("INFO")
+
+  # Создаем тренер
+  trainer = ModelTrainer()
+
+  # Генерируем тестовые данные
+  np.random.seed(42)
+  n_samples = 2000
+
+  dates = pd.date_range(start='2023-01-01', periods=n_samples, freq='1H')
+  test_data = pd.DataFrame({
+    'timestamp': dates,
+    'open': np.random.randn(n_samples).cumsum() + 100,
+    'high': np.random.randn(n_samples).cumsum() + 102,
+    'low': np.random.randn(n_samples).cumsum() + 98,
+    'close': np.random.randn(n_samples).cumsum() + 100,
+    'volume': np.random.randint(1000, 10000, n_samples)
+  })
+
+  # Обучаем модель
+  results = trainer.train_lorentzian_model(
+    test_data,
+    validation_method='time_series',
+    test_size=0.2
+  )
+
+  if results.get('success'):
+    logger.info("Обучение завершено успешно!")
+    logger.info(f"Точность: {results['metrics']['accuracy']:.4f}")
+
+    # Создаем отчет
+    if 'model_name' in results:
+      report = trainer.create_model_report(results['model_name'])
+      print(report)
+  else:
+    logger.error(f"Ошибка обучения: {results.get('error', 'Unknown error')}")
