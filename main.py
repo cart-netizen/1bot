@@ -11,7 +11,8 @@ from logger_setup import setup_logging, get_logger
 import config  # Загрузка конфигурации
 from core.bybit_connector import BybitConnector
 from core.data_fetcher import DataFetcher
-from core.database_manager_new import DatabaseManager
+from core.database_manager_new import AdvancedDatabaseManager
+from core.database_manager import DatabaseManager
 from core.trade_executor import TradeExecutor
 from core.monitoring_service import MonitoringService
 from ml_models.lorentzian_classifier import LorentzianClassifier  # и его обучение/загрузка

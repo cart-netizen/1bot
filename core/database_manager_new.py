@@ -13,7 +13,15 @@ from enum import Enum
 import asyncio
 import json
 from abc import ABC, abstractmethod
+# Регистрация адаптеров для datetime в SQLite
+def adapt_datetime_iso(val):
+    return val.isoformat()
 
+def convert_datetime(val):
+    return datetime.datetime.fromisoformat(val.decode())
+
+sqlite3.register_adapter(datetime.datetime, adapt_datetime_iso)
+sqlite3.register_converter("timestamp", convert_datetime)
 
 # ==============================================================================
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
@@ -72,7 +80,8 @@ class AdvancedDatabaseManager:
     try:
       self.conn = sqlite3.connect(
         self.db_path,
-        detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        # detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        detect_types=sqlite3.PARSE_DECLTYPES,
         check_same_thread=False
       )
       # Оптимизация SQLite для торговых данных
@@ -324,9 +333,24 @@ class EnsembleMLStrategy:
     df['macd_signal'] = ta.macd(df['close'])['MACDs_12_26_9']
     df['macd_hist'] = ta.macd(df['close'])['MACDh_12_26_9']
 
-    df['bb_upper'] = ta.bbands(df['close'])['BBU_20_2.0']
-    df['bb_lower'] = ta.bbands(df['close'])['BBL_20_2.0']
-    df['bb_percent'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+    bb_data = ta.bbands(df['close'])
+    if bb_data is not None and not bb_data.empty:
+      bb_cols = bb_data.columns.tolist()
+      upper_col = [col for col in bb_cols if 'BBU' in col][0] if any('BBU' in col for col in bb_cols) else None
+      lower_col = [col for col in bb_cols if 'BBL' in col][0] if any('BBL' in col for col in bb_cols) else None
+
+      if upper_col and lower_col:
+        df['bb_upper'] = bb_data[upper_col]
+        df['bb_lower'] = bb_data[lower_col]
+        df['bb_percent'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+      else:
+        df['bb_upper'] = df['close'] * 1.02
+        df['bb_lower'] = df['close'] * 0.98
+        df['bb_percent'] = 0.5
+    else:
+      df['bb_upper'] = df['close'] * 1.02
+      df['bb_lower'] = df['close'] * 0.98
+      df['bb_percent'] = 0.5
 
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     df['atr_percent'] = df['atr'] / df['close']
@@ -937,7 +961,7 @@ async def demo_trading_system():
       """Генерирует тестовые рыночные данные"""
 
       dates = pd.date_range(start=datetime.datetime.now() - datetime.timedelta(days=days),
-                            periods=days * 24, freq='H')  # Часовые данные
+                            periods=days * 24, freq='h')  # Часовые данные
 
       np.random.seed(42 if symbol == "BTCUSDT" else 24)
 
