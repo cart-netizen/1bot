@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import ccxt
 
 from core.bybit_connector import BybitConnector
-from core.database_manager import DatabaseManager
+from core.database_manager_new import DatabaseManager
 from logger_setup import get_logger
 from config import LEVERAGE  # Глобальное плечо по умолчанию
 

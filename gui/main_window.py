@@ -15,7 +15,7 @@ from datetime import datetime
 from logger_setup import get_logger
 # Импорты других ваших модулей
 from core.bybit_connector import BybitConnector
-from core.database_manager import DatabaseManager
+from core.database_manager_new import DatabaseManager
 from core.trade_executor import TradeExecutor
 from core.data_fetcher import DataFetcher  # Для получения данных для графиков
 from config import LEVERAGE, API_KEY, API_SECRET

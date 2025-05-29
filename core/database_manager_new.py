@@ -673,3 +673,416 @@ class AdvancedRiskManager:
       )
     else:
       recommended_size = account_balance * 0.02 / signal.price  #
+      # Продолжение метода validate_signal класса AdvancedRiskManager
+
+      validation_result['recommended_size'] = recommended_size
+      validation_result['risk_score'] = risk_per_trade
+
+      # 4. Проверка корреляции с открытыми позициями
+      correlation_risk = await self._check_correlation_risk(symbol)
+      if correlation_risk > 0.7:
+        validation_result['warnings'].append(f"Высокая корреляция с открытыми позициями: {correlation_risk:.2f}")
+        recommended_size *= 0.5  # Уменьшаем размер при высокой корреляции
+
+      # 5. Проверка волатильности
+      volatility_risk = await self._check_volatility_risk(symbol, signal.price)
+      if volatility_risk > 0.8:
+        validation_result['warnings'].append("Высокая волатильность рынка")
+        recommended_size *= 0.7
+
+      # 6. Финальная валидация
+      if recommended_size < account_balance * 0.001:  # Минимальный размер 0.1%
+        validation_result['reasons'].append("Размер позиции слишком мал")
+        return validation_result
+
+      validation_result['approved'] = True
+      validation_result['recommended_size'] = recommended_size
+      validation_result['reasons'].append(f"Сигнал одобрен с размером {recommended_size:.6f}")
+
+      return validation_result
+
+    async def _check_correlation_risk(self, symbol: str) -> float:
+      """Проверяет корреляцию с открытыми позициями"""
+      # Простая имитация проверки корреляции
+      # В реальности здесь был бы анализ корреляции между активами
+      return 0.3  # Низкая корреляция
+
+    async def _check_volatility_risk(self, symbol: str, price: float) -> float:
+      """Проверяет риск волатильности"""
+      # Простая имитация анализа волатильности
+      return 0.5  # Средняя волатильность
+
+    def calculate_position_size_kelly(self, win_rate: float, avg_win: float, avg_loss: float,
+                                      account_balance: float) -> float:
+      """Вычисляет оптимальный размер позиции по критерию Келли"""
+      if avg_loss <= 0 or win_rate <= 0:
+        return 0
+
+      # Формула Келли: f = (bp - q) / b
+      # где b = avg_win/avg_loss, p = win_rate, q = 1-win_rate
+      b = avg_win / abs(avg_loss)
+      p = win_rate
+      q = 1 - win_rate
+
+      kelly_fraction = (b * p - q) / b
+
+      # Ограничиваем максимальный размер для безопасности
+      kelly_fraction = max(0, min(kelly_fraction, 0.25))  # Максимум 25%
+
+      return account_balance * kelly_fraction
+
+    async def update_risk_metrics(self, symbol: str = None):
+      """Обновляет риск-метрики в базе данных"""
+      risk_metrics = self.db_manager.get_risk_metrics(symbol, days=30)
+
+      query = '''
+                INSERT INTO risk_metrics (
+                    timestamp, symbol, current_drawdown, max_drawdown, win_rate, 
+                    profit_factor, sharpe_ratio, daily_pnl
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            '''
+
+      try:
+        # Рассчитываем дополнительные метрики
+        max_drawdown = abs(risk_metrics.current_drawdown) * 1.2  # Примерное значение
+        profit_factor = abs(risk_metrics.avg_profit_loss) / 0.01 if risk_metrics.avg_profit_loss < 0 else 2.0
+
+        self.db_manager.conn.execute(query, (
+          datetime.datetime.now(), symbol, risk_metrics.current_drawdown,
+          max_drawdown, risk_metrics.win_rate, profit_factor,
+          risk_metrics.sharpe_ratio, risk_metrics.avg_profit_loss
+        ))
+        self.db_manager.conn.commit()
+
+        print(f"✅ Риск-метрики обновлены для {symbol or 'всех символов'}")
+      except sqlite3.Error as e:
+        print(f"❌ Ошибка обновления риск-метрик: {e}")
+
+  # ==============================================================================
+  # ИНТЕГРИРОВАННАЯ ТОРГОВАЯ СИСТЕМА
+  # ==============================================================================
+
+class IntegratedTradingSystem:
+    """Главная интегрированная торговая система"""
+
+    def __init__(self, db_path: str = "advanced_trading.db"):
+      self.db_manager = AdvancedDatabaseManager(db_path)
+      self.ml_strategy = EnsembleMLStrategy(self.db_manager)
+      self.risk_manager = AdvancedRiskManager(self.db_manager)
+      self.active_symbols = []
+      self.account_balance = 10000.0  # Начальный баланс
+      self.running = False
+
+    async def add_symbol(self, symbol: str):
+      """Добавляет символ для торговли"""
+      if symbol not in self.active_symbols:
+        self.active_symbols.append(symbol)
+        print(f"✅ Символ {symbol} добавлен в торговую систему")
+
+    async def remove_symbol(self, symbol: str):
+      """Удаляет символ из торговли"""
+      if symbol in self.active_symbols:
+        self.active_symbols.remove(symbol)
+        print(f"❌ Символ {symbol} удален из торговой системы")
+
+    async def process_market_data(self, symbol: str, data: pd.DataFrame) -> Optional[Dict[str, Any]]:
+      """Обрабатывает рыночные данные и генерирует торговые решения"""
+
+      if symbol not in self.active_symbols:
+        return None
+
+      try:
+        # 1. Генерируем сигнал
+        signal = await self.ml_strategy.generate_signals(symbol, data)
+
+        if not signal:
+          return {'action': 'no_signal', 'symbol': symbol}
+
+        # 2. Валидируем сигнал через риск-менеджер
+        validation = await self.risk_manager.validate_signal(signal, symbol, self.account_balance)
+
+        if not validation['approved']:
+          print(f"⚠️ Сигнал для {symbol} отклонен: {', '.join(validation['reasons'])}")
+          return {
+            'action': 'signal_rejected',
+            'symbol': symbol,
+            'signal': signal,
+            'validation': validation
+          }
+
+        # 3. Создаем торговое решение
+        trade_decision = {
+          'action': 'execute_trade',
+          'symbol': symbol,
+          'signal': signal,
+          'validation': validation,
+          'recommended_size': validation['recommended_size'],
+          'risk_score': validation['risk_score'],
+          'order_id': f"{symbol}_{int(datetime.datetime.now().timestamp())}"
+        }
+
+        print(f"🎯 Торговое решение для {symbol}:")
+        print(f"   Действие: {signal.signal.value}")
+        print(f"   Размер: {validation['recommended_size']:.6f}")
+        print(f"   Уверенность: {signal.confidence:.2%}")
+        print(f"   Риск-счет: {validation['risk_score']:.2%}")
+
+        return trade_decision
+
+      except Exception as e:
+        print(f"❌ Ошибка обработки данных для {symbol}: {e}")
+        return {'action': 'error', 'symbol': symbol, 'error': str(e)}
+
+    async def execute_trade_decision(self, trade_decision: Dict[str, Any]) -> bool:
+      """Выполняет торговое решение"""
+
+      if trade_decision['action'] != 'execute_trade':
+        return False
+
+      signal = trade_decision['signal']
+      order_id = trade_decision['order_id']
+      quantity = trade_decision['recommended_size']
+
+      try:
+        # Добавляем сделку в базу данных
+        trade_id = self.db_manager.add_trade_with_signal(signal, order_id, quantity)
+
+        if trade_id:
+          # Логируем выполненный сигнал
+          self.db_manager.log_signal(signal, trade_decision['symbol'], executed=True)
+
+          print(f"✅ Сделка выполнена (ID: {trade_id})")
+          return True
+        else:
+          print(f"❌ Ошибка выполнения сделки для {trade_decision['symbol']}")
+          return False
+
+      except Exception as e:
+        print(f"❌ Ошибка выполнения торгового решения: {e}")
+        return False
+
+    async def update_account_balance(self, new_balance: float):
+      """Обновляет баланс аккаунта"""
+      self.account_balance = new_balance
+      print(f"💰 Баланс аккаунта обновлен: ${new_balance:,.2f}")
+
+    async def get_performance_report(self, days: int = 30) -> Dict[str, Any]:
+      """Генерирует отчет о производительности"""
+
+      total_metrics = self.db_manager.get_risk_metrics(days=days)
+
+      report = {
+        'period_days': days,
+        'account_balance': self.account_balance,
+        'total_return': total_metrics.avg_profit_loss * 100,  # В процентах
+        'win_rate': total_metrics.win_rate * 100,
+        'sharpe_ratio': total_metrics.sharpe_ratio,
+        'max_drawdown': abs(total_metrics.current_drawdown) * 100,
+        'active_symbols': len(self.active_symbols),
+        'symbols': []
+      }
+
+      # Добавляем метрики по каждому символу
+      for symbol in self.active_symbols:
+        symbol_metrics = self.db_manager.get_risk_metrics(symbol, days)
+        report['symbols'].append({
+          'symbol': symbol,
+          'return': symbol_metrics.avg_profit_loss * 100,
+          'win_rate': symbol_metrics.win_rate * 100,
+          'sharpe_ratio': symbol_metrics.sharpe_ratio
+        })
+
+      return report
+
+    async def start_trading(self):
+      """Запускает торговую систему"""
+      self.running = True
+      print("🚀 Интегрированная торговая система запущена!")
+      print(f"   Активные символы: {', '.join(self.active_symbols)}")
+      print(f"   Баланс аккаунта: ${self.account_balance:,.2f}")
+
+    async def stop_trading(self):
+      """Останавливает торговую систему"""
+      self.running = False
+      print("⏹️ Торговая система остановлена")
+
+    def __del__(self):
+      """Закрывает соединение с БД при удалении объекта"""
+      if hasattr(self, 'db_manager') and self.db_manager.conn:
+        self.db_manager.conn.close()
+
+  # ==============================================================================
+  # ПРИМЕР ИСПОЛЬЗОВАНИЯ И ТЕСТИРОВАНИЕ
+  # ==============================================================================
+
+async def demo_trading_system():
+    """Демонстрация работы интегрированной торговой системы"""
+
+    print("=" * 70)
+    print("🎯 ДЕМОНСТРАЦИЯ ИНТЕГРИРОВАННОЙ ТОРГОВОЙ СИСТЕМЫ")
+    print("=" * 70)
+
+    # Создаем систему
+    trading_system = IntegratedTradingSystem()
+
+    # Добавляем символы для торговли
+    await trading_system.add_symbol("BTCUSDT")
+    await trading_system.add_symbol("ETHUSDT")
+
+    # Запускаем систему
+    await trading_system.start_trading()
+
+    # Генерируем тестовые данные
+    def generate_test_data(symbol: str, days: int = 100) -> pd.DataFrame:
+      """Генерирует тестовые рыночные данные"""
+
+      dates = pd.date_range(start=datetime.datetime.now() - datetime.timedelta(days=days),
+                            periods=days * 24, freq='H')  # Часовые данные
+
+      np.random.seed(42 if symbol == "BTCUSDT" else 24)
+
+      # Базовая цена
+      base_price = 45000 if symbol == "BTCUSDT" else 3000
+
+      # Генерируем случайное движение цен
+      returns = np.random.normal(0.0001, 0.02, len(dates))  # Небольшой положительный тренд
+      prices = [base_price]
+
+      for ret in returns[1:]:
+        prices.append(prices[-1] * (1 + ret))
+
+      # Создаем OHLCV данные
+      data = pd.DataFrame({
+        'timestamp': dates,
+        'open': prices,
+        'high': [p * (1 + abs(np.random.normal(0, 0.01))) for p in prices],
+        'low': [p * (1 - abs(np.random.normal(0, 0.01))) for p in prices],
+        'close': prices,
+        'volume': np.random.uniform(100, 1000, len(dates))
+      })
+
+      return data
+
+    # Тестируем обработку данных
+    print("\n📊 Тестирование обработки рыночных данных...")
+
+    for symbol in ["BTCUSDT", "ETHUSDT"]:
+      print(f"\n--- Анализ {symbol} ---")
+
+      # Генерируем тестовые данные
+      test_data = generate_test_data(symbol)
+
+      # Обрабатываем данные
+      decision = await trading_system.process_market_data(symbol, test_data)
+
+      if decision and decision['action'] == 'execute_trade':
+        # Выполняем торговое решение
+        success = await trading_system.execute_trade_decision(decision)
+
+        if success:
+          print(f"✅ Сделка для {symbol} успешно выполнена")
+        else:
+          print(f"❌ Ошибка выполнения сделки для {symbol}")
+      else:
+        print(f"ℹ️ Торговых сигналов для {symbol} не обнаружено")
+
+    # Обновляем баланс (имитация прибыли)
+    await trading_system.update_account_balance(10500.0)
+
+    # Генерируем отчет о производительности
+    print("\n📈 Отчет о производительности:")
+    report = await trading_system.get_performance_report(days=7)
+
+    print(f"   Период: {report['period_days']} дней")
+    print(f"   Баланс: ${report['account_balance']:,.2f}")
+    print(f"   Общая доходность: {report['total_return']:.2f}%")
+    print(f"   Процент выигрышных сделок: {report['win_rate']:.1f}%")
+    print(f"   Коэффициент Шарпа: {report['sharpe_ratio']:.2f}")
+    print(f"   Максимальная просадка: {report['max_drawdown']:.2f}%")
+
+    # Останавливаем систему
+    await trading_system.stop_trading()
+
+    print("\n🎉 Демонстрация завершена!")
+
+  # ==============================================================================
+  # ДОПОЛНИТЕЛЬНЫЕ УТИЛИТЫ
+  # ==============================================================================
+
+class TradingAnalytics:
+    """Аналитические инструменты для торговой системы"""
+
+    def __init__(self, db_manager: AdvancedDatabaseManager):
+      self.db_manager = db_manager
+
+    def calculate_portfolio_metrics(self, symbols: List[str], days: int = 30) -> Dict[str, float]:
+      """Вычисляет метрики портфеля"""
+
+      total_return = 0.0
+      total_trades = 0
+      win_trades = 0
+
+      for symbol in symbols:
+        metrics = self.db_manager.get_risk_metrics(symbol, days)
+        total_return += metrics.avg_profit_loss
+
+        # Получаем количество сделок (упрощенная логика)
+        cursor = self.db_manager.conn.cursor()
+        cursor.execute(
+          "SELECT COUNT(*) FROM trades WHERE symbol = ? AND open_timestamp >= ?",
+          (symbol, datetime.datetime.now() - datetime.timedelta(days=days))
+        )
+        symbol_trades = cursor.fetchone()[0]
+        total_trades += symbol_trades
+
+        if metrics.win_rate > 0:
+          win_trades += int(symbol_trades * metrics.win_rate)
+
+      portfolio_win_rate = win_trades / total_trades if total_trades > 0 else 0
+
+      return {
+        'total_return': total_return,
+        'portfolio_win_rate': portfolio_win_rate,
+        'total_trades': total_trades,
+        'avg_return_per_trade': total_return / total_trades if total_trades > 0 else 0
+      }
+
+    def export_trading_log(self, days: int = 30) -> pd.DataFrame:
+      """Экспортирует лог торговых операций"""
+
+      query = '''
+                SELECT 
+                    t.symbol, t.strategy, t.side, t.open_timestamp,
+                    t.close_timestamp, t.open_price, t.close_price,
+                    t.quantity, t.profit_loss, t.confidence
+                FROM trades t
+                WHERE t.open_timestamp >= ?
+                ORDER BY t.open_timestamp DESC
+            '''
+
+      cursor = self.db_manager.conn.cursor()
+      cursor.execute(query, (datetime.datetime.now() - datetime.timedelta(days=days),))
+
+      columns = ['symbol', 'strategy', 'side', 'open_timestamp', 'close_timestamp',
+                 'open_price', 'close_price', 'quantity', 'profit_loss', 'confidence']
+
+      return pd.DataFrame(cursor.fetchall(), columns=columns)
+
+  # ==============================================================================
+  # ТОЧКА ВХОДА ДЛЯ ЗАПУСКА
+  # ==============================================================================
+
+if __name__ == "__main__":
+    """Главная точка входа"""
+
+    print("🚀 Запуск интегрированной торговой системы...")
+
+    # Запускаем демонстрацию
+    asyncio.run(demo_trading_system())
+
+    print("\n✨ Система готова к использованию!")
+    print("   Для интеграции с реальным API добавьте:")
+    print("   - Подключение к бирже (Binance, ByBit и т.д.)")
+    print("   - Real-time получение данных")
+    print("   - Выполнение реальных ордеров")
+    print("   - Мониторинг позиций")
