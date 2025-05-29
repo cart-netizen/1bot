@@ -13,6 +13,8 @@ from enum import Enum
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from trade_executor import TradeExecutor
+
 # Регистрация адаптеров для datetime в SQLite
 def adapt_datetime_iso(val):
     return val.isoformat()
@@ -785,6 +787,53 @@ class AdvancedRiskManager:
   # ==============================================================================
   # ИНТЕГРИРОВАННАЯ ТОРГОВАЯ СИСТЕМА
   # ==============================================================================
+class SignalProcessor:
+    """Отдельный процессор для верификации сигналов"""
+
+    def __init__(self, risk_manager: AdvancedRiskManager):
+      self.risk_manager = risk_manager
+
+    async def verify_signal(self, signal: TradingSignal, symbol: str, balance: float) -> Dict[str, Any]:
+      return await self.risk_manager.validate_signal(signal, symbol, balance)
+
+
+# class TradeExecutor:
+#   """Отдельный исполнитель торговых ордеров"""
+#
+#   def __init__(self, db_manager: AdvancedDatabaseManager):
+#     self.db_manager = db_manager
+#
+#   async def execute_order(self, trade_decision: Dict[str, Any]) -> bool:
+#     # Логика исполнения ордера
+#     signal = trade_decision['signal']
+#     order_id = trade_decision['order_id']
+#     quantity = trade_decision['recommended_size']
+#
+#     trade_id = self.db_manager.add_trade_with_signal(signal, order_id, quantity)
+#     return trade_id is not None
+
+
+class MLFeedbackLoop:
+  """Цикл обратной связи для улучшения ML модели"""
+
+  def __init__(self, db_manager: AdvancedDatabaseManager, ml_strategy: EnsembleMLStrategy):
+    self.db_manager = db_manager
+    self.ml_strategy = ml_strategy
+
+  async def update_model_with_results(self, symbol: str):
+    # Получаем результаты недавних сделок
+    cursor = self.db_manager.conn.cursor()
+    cursor.execute("""
+            SELECT profit_loss, confidence, metadata 
+            FROM trades 
+            WHERE symbol = ? AND status = 'CLOSED' 
+            AND close_timestamp >= datetime('now', '-7 days')
+        """, (symbol,))
+
+    results = cursor.fetchall()
+    if results:
+      # Обновляем веса модели на основе результатов
+      await self.ml_strategy.retrain_with_feedback(symbol, results)
 
 class IntegratedTradingSystem:
     """Главная интегрированная торговая система"""
@@ -793,6 +842,11 @@ class IntegratedTradingSystem:
       self.db_manager = AdvancedDatabaseManager(db_path)
       self.ml_strategy = EnsembleMLStrategy(self.db_manager)
       self.risk_manager = AdvancedRiskManager(self.db_manager)
+
+      self.signal_processor = SignalProcessor(self.risk_manager)
+      self.trade_executor = TradeExecutor(self.db_manager)
+      self.ml_feedback = MLFeedbackLoop(self.db_manager, self.ml_strategy)
+
       self.active_symbols = []
       self.account_balance = 10000.0  # Начальный баланс
       self.running = False
