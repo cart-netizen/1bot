@@ -201,7 +201,7 @@ async def main_async():
   # 2. Инициализация и обучение/загрузка ML модели
   # ВАЖНО: Этот этап требует реальных данных и процесса обучения.
   # Сейчас это заглушка.
-  ml_model = LorentzianClassifier(n_neighbors=5)  # Параметры из конфига или по умолчанию
+  ml_model = LorentzianClassifier(n_neighbors=8)  # Параметры из конфига или по умолчанию
   try:
     # Попытка загрузить предобученную модель
     # ml_model.load_model("path/to/your/trained_lorentzian_model.pkl")
