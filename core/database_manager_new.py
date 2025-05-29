@@ -12,9 +12,18 @@ from dataclasses import dataclass
 from enum import Enum
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
+
+from PyQt6.QtWidgets import QTableWidgetItem
+
 # from core.trade_executor import TradeExecutor
 from core.bybit_connector import BybitConnector
+from ml_models.lorentzian_classifier import LorentzianClassifier
+from strategies.base_strategy import BaseStrategy
+
+
+#from data_fetcher import DataFetcher
 # Регистрация адаптеров для datetime в SQLite
 def adapt_datetime_iso(val):
     return val.isoformat()
@@ -55,13 +64,30 @@ class TradingSignal:
 
 @dataclass
 class RiskMetrics:
-  max_position_size: float
-  current_drawdown: float
-  daily_loss_limit: float
-  win_rate: float
-  avg_profit_loss: float
-  sharpe_ratio: float
+  total_trades = 0
+  winning_trades = 0
+  losing_trades = 0
+  win_rate = 0.0
+  total_pnl = 0.0
+  avg_win = 0.0
+  avg_loss = 0.0
+  profit_factor = 0.0
 
+  # Добавляем недостающие атрибуты
+  max_drawdown = 0.0
+  current_drawdown = 0.0
+  sharpe_ratio = 0.0
+  volatility = 0.0
+  max_consecutive_losses = 0
+  max_consecutive_wins = 0
+  risk_reward_ratio = 0.0
+  recovery_factor = 0.0
+  calmar_ratio = 0.0
+
+  # Временные метрики
+  daily_pnl = 0.0
+  weekly_pnl = 0.0
+  monthly_pnl = 0.0
 
 # ==============================================================================
 # ПРОДВИНУТЫЙ МЕНЕДЖЕР БАЗЫ ДАННЫХ
@@ -76,6 +102,8 @@ class AdvancedDatabaseManager:
     self._connect()
     self._create_all_tables()
     self._cache = {}  # Простой кэш для часто используемых данных
+    self.add_missing_columns()
+
 
   def _connect(self):
     """Устанавливает соединение с базой данных SQLite с оптимизацией"""
@@ -172,6 +200,51 @@ class AdvancedDatabaseManager:
 
     self.conn.commit()
 
+  def add_missing_columns(self):
+    """Добавить отсутствующие столбцы в существующие таблицы"""
+    try:
+      cursor = self.conn.cursor()
+
+      # Проверяем существование столбца created_at в таблице trades
+      cursor.execute("PRAGMA table_info(trades)")
+      columns = [column[1] for column in cursor.fetchall()]
+
+      if 'created_at' not in columns:
+        cursor.execute("""
+                ALTER TABLE trades 
+                ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            """)
+        print("Добавлен столбец created_at в таблицу trades")
+
+      self.conn.commit()
+
+    except Exception as e:
+      print(f"Ошибка при добавлении столбцов: {e}")
+
+
+  def get_all_trades(self, limit: int = 50) -> List[Dict]:
+    """Получить все сделки с лимитом"""
+    try:
+      cursor = self.conn.cursor()
+      cursor.execute("""
+              SELECT * FROM trades 
+              ORDER BY created_at DESC 
+              LIMIT ?
+          """, (limit,))
+
+      columns = [description[0] for description in cursor.description]
+      trades = []
+
+      for row in cursor.fetchall():
+        trade_dict = dict(zip(columns, row))
+        trades.append(trade_dict)
+
+      return trades
+
+    except Exception as e:
+      print(f"Ошибка при получении сделок: {e}")
+      return []
+
   def add_trade_with_signal(self, signal: TradingSignal, order_id: str, quantity: float, leverage: int = 1) -> Optional[
     int]:
     """Добавляет сделку на основе торгового сигнала"""
@@ -237,48 +310,264 @@ class AdvancedDatabaseManager:
     except sqlite3.Error as e:
       print(f"❌ Ошибка обновления метрик модели: {e}")
 
-  def get_risk_metrics(self, symbol: str = None, days: int = 30) -> RiskMetrics:
-    """Вычисляет риск-метрики за указанный период"""
-    date_filter = datetime.datetime.now() - datetime.timedelta(days=days)
-
-    base_query = '''
-            SELECT * FROM trades 
-            WHERE open_timestamp >= ? AND status = 'CLOSED'
-        '''
-    params = [date_filter]
-
-    if symbol:
-      base_query += ' AND symbol = ?'
-      params.append(symbol)
-
+  def get_risk_metrics(self, symbol: str = None):
+    """Получить риск-метрики для символа"""
     try:
-      cursor = self.conn.cursor()
-      cursor.execute(base_query, params)
-      trades = cursor.fetchall()
+      metrics = RiskMetrics()
+
+      # Получаем сделки
+      if symbol:
+        trades = self.get_trades_for_symbol(symbol)
+      else:
+        trades = self.get_all_trades(limit=1000)
 
       if not trades:
-        return RiskMetrics(0, 0, 0, 0, 0, 0)
+        return metrics
 
-      profits = [trade[11] for trade in trades if trade[11] is not None]  # profit_loss column
+      # Основные метрики
+      metrics.total_trades = len(trades)
+      profitable_trades = [t for t in trades if t.get('pnl', 0) > 0]
+      losing_trades = [t for t in trades if t.get('pnl', 0) < 0]
 
-      win_trades = [p for p in profits if p > 0]
-      win_rate = len(win_trades) / len(profits) if profits else 0
-      avg_profit_loss = sum(profits) / len(profits) if profits else 0
+      metrics.winning_trades = len(profitable_trades)
+      metrics.losing_trades = len(losing_trades)
 
-      current_drawdown = self._calculate_drawdown(profits)
-      sharpe_ratio = self._calculate_sharpe_ratio(profits)
+      if metrics.total_trades > 0:
+        metrics.win_rate = metrics.winning_trades / metrics.total_trades
 
-      return RiskMetrics(
-        max_position_size=max([trade[9] for trade in trades]),  # quantity
-        current_drawdown=current_drawdown,
-        daily_loss_limit=abs(min(profits)) * 2 if profits else 0,
-        win_rate=win_rate,
-        avg_profit_loss=avg_profit_loss,
-        sharpe_ratio=sharpe_ratio
-      )
-    except sqlite3.Error as e:
-      print(f"❌ Ошибка расчета риск-метрик: {e}")
-      return RiskMetrics(0, 0, 0, 0, 0, 0)
+      # PnL метрики
+      all_pnl = [t.get('pnl', 0) for t in trades]
+      metrics.total_pnl = sum(all_pnl)
+
+      if profitable_trades:
+        metrics.avg_win = sum(t.get('pnl', 0) for t in profitable_trades) / len(profitable_trades)
+
+      if losing_trades:
+        metrics.avg_loss = sum(t.get('pnl', 0) for t in losing_trades) / len(losing_trades)
+
+      # Profit Factor
+      total_profit = sum(t.get('pnl', 0) for t in profitable_trades)
+      total_loss = abs(sum(t.get('pnl', 0) for t in losing_trades))
+
+      if total_loss > 0:
+        metrics.profit_factor = total_profit / total_loss
+
+      # Временные PnL
+      metrics.daily_pnl = self._calculate_daily_pnl(trades)
+      metrics.weekly_pnl = self._calculate_weekly_pnl(trades)
+      metrics.monthly_pnl = self._calculate_monthly_pnl(trades)
+
+      # Риск метрики
+      metrics.max_drawdown = self._calculate_max_drawdown(all_pnl)
+      metrics.sharpe_ratio = self._calculate_sharpe_ratio(all_pnl)
+      metrics.volatility = self._calculate_volatility(all_pnl)
+
+      # Дополнительные метрики
+      metrics.max_consecutive_wins = self._calculate_max_consecutive_wins(trades)
+      metrics.max_consecutive_losses = self._calculate_max_consecutive_losses(trades)
+
+      if metrics.avg_loss != 0:
+        metrics.risk_reward_ratio = abs(metrics.avg_win / metrics.avg_loss)
+
+      return metrics
+
+    except Exception as e:
+      print(f"Ошибка при расчете риск-метрик: {e}")
+      return RiskMetrics()
+
+  def _calculate_daily_pnl(self, trades: list) -> float:
+      """Рассчитать дневной PnL"""
+      try:
+        from datetime import datetime, timedelta
+
+        today = datetime.now().date()
+        daily_trades = []
+
+        for trade in trades:
+          # Попробуем извлечь дату из разных возможных полей
+          trade_date = None
+
+          if 'created_at' in trade and trade['created_at']:
+            try:
+              if isinstance(trade['created_at'], str):
+                trade_date = datetime.strptime(trade['created_at'][:10], '%Y-%m-%d').date()
+              else:
+                trade_date = trade['created_at'].date()
+            except:
+              pass
+
+          if trade_date and trade_date == today:
+            daily_trades.append(trade)
+
+        return sum(t.get('pnl', 0) for t in daily_trades)
+
+      except Exception as e:
+        print(f"Ошибка при расчете дневного PnL: {e}")
+        return 0.0
+
+  def _calculate_weekly_pnl(self, trades: list) -> float:
+    """Рассчитать недельный PnL"""
+    try:
+      from datetime import datetime, timedelta
+
+      today = datetime.now().date()
+      week_ago = today - timedelta(days=7)
+      weekly_trades = []
+
+      for trade in trades:
+        trade_date = None
+
+        if 'created_at' in trade and trade['created_at']:
+          try:
+            if isinstance(trade['created_at'], str):
+              trade_date = datetime.strptime(trade['created_at'][:10], '%Y-%m-%d').date()
+            else:
+              trade_date = trade['created_at'].date()
+          except:
+            pass
+
+        if trade_date and week_ago <= trade_date <= today:
+          weekly_trades.append(trade)
+
+      return sum(t.get('pnl', 0) for t in weekly_trades)
+
+    except Exception as e:
+      print(f"Ошибка при расчете недельного PnL: {e}")
+      return 0.0
+
+  def _calculate_monthly_pnl(self, trades: list) -> float:
+    """Рассчитать месячный PnL"""
+    try:
+      from datetime import datetime, timedelta
+
+      today = datetime.now().date()
+      month_ago = today - timedelta(days=30)
+      monthly_trades = []
+
+      for trade in trades:
+        trade_date = None
+
+        if 'created_at' in trade and trade['created_at']:
+          try:
+            if isinstance(trade['created_at'], str):
+              trade_date = datetime.strptime(trade['created_at'][:10], '%Y-%m-%d').date()
+            else:
+              trade_date = trade['created_at'].date()
+          except:
+            pass
+
+        if trade_date and month_ago <= trade_date <= today:
+          monthly_trades.append(trade)
+
+      return sum(t.get('pnl', 0) for t in monthly_trades)
+
+    except Exception as e:
+      print(f"Ошибка при расчете месячного PnL: {e}")
+      return 0.0
+
+  def _calculate_sharpe_ratio(self, pnl_series: list) -> float:
+    """Рассчитать коэффициент Шарпа"""
+    try:
+      if len(pnl_series) < 2:
+        return 0.0
+
+      import statistics
+
+      mean_return = statistics.mean(pnl_series)
+      std_return = statistics.stdev(pnl_series)
+
+      if std_return == 0:
+        return 0.0
+
+      return mean_return / std_return
+
+    except Exception as e:
+      print(f"Ошибка при расчете коэффициента Шарпа: {e}")
+      return 0.0
+
+  def _calculate_volatility(self, pnl_series: list) -> float:
+    """Рассчитать волатильность"""
+    try:
+      if len(pnl_series) < 2:
+        return 0.0
+
+      import statistics
+      return statistics.stdev(pnl_series)
+
+    except Exception as e:
+      print(f"Ошибка при расчете волатильности: {e}")
+      return 0.0
+
+  def _calculate_max_consecutive_wins(self, trades: list) -> int:
+    """Рассчитать максимальное количество последовательных выигрышей"""
+    try:
+      max_wins = 0
+      current_wins = 0
+
+      for trade in trades:
+        if trade.get('pnl', 0) > 0:
+          current_wins += 1
+          max_wins = max(max_wins, current_wins)
+        else:
+          current_wins = 0
+
+      return max_wins
+
+    except Exception as e:
+      print(f"Ошибка при расчете максимальных последовательных выигрышей: {e}")
+      return 0
+
+  def _calculate_max_consecutive_losses(self, trades: list) -> int:
+    """Рассчитать максимальное количество последовательных проигрышей"""
+    try:
+      max_losses = 0
+      current_losses = 0
+
+      for trade in trades:
+        if trade.get('pnl', 0) < 0:
+          current_losses += 1
+          max_losses = max(max_losses, current_losses)
+        else:
+          current_losses = 0
+
+      return max_losses
+
+    except Exception as e:
+      print(f"Ошибка при расчете максимальных последовательных проигрышей: {e}")
+      return 0
+
+  def _calculate_max_drawdown(self, pnl_series: list) -> float:
+    """Вычислить максимальную просадку"""
+    if not pnl_series:
+      return 0.0
+
+    try:
+      cumulative_pnl = []
+      running_total = 0
+
+      for pnl in pnl_series:
+        running_total += pnl
+        cumulative_pnl.append(running_total)
+
+      if not cumulative_pnl:
+        return 0.0
+
+      max_drawdown = 0.0
+      peak = cumulative_pnl[0]
+
+      for current_value in cumulative_pnl:
+        if current_value > peak:
+          peak = current_value
+
+        if peak > 0:
+          drawdown = (peak - current_value) / peak
+          max_drawdown = max(max_drawdown, drawdown)
+
+      return max_drawdown
+
+    except Exception as e:
+      print(f"Ошибка при расчете максимальной просадки: {e}")
+      return 0.0
 
   def _calculate_drawdown(self, profits: List[float]) -> float:
     """Вычисляет текущую просадку"""
@@ -303,6 +592,43 @@ class AdvancedDatabaseManager:
 
     return float(np.mean(excess_returns) / np.std(excess_returns) * np.sqrt(252))
 
+  def get_trades_for_symbol(self, symbol: str, limit: int = 100) -> List[Dict]:
+    """Получить сделки для конкретного символа"""
+    try:
+      cursor = self.conn.cursor()
+
+      # Проверяем структуру таблицы
+      cursor.execute("PRAGMA table_info(trades)")
+      columns_info = cursor.fetchall()
+      column_names = [col[1] for col in columns_info]
+
+      # Выбираем столбец для сортировки
+      if 'created_at' in column_names:
+        order_column = 'created_at'
+      elif 'id' in column_names:
+        order_column = 'id'
+      else:
+        order_column = 'rowid'
+
+      cursor.execute(f"""
+            SELECT * FROM trades 
+            WHERE symbol = ?
+            ORDER BY {order_column} DESC 
+            LIMIT ?
+        """, (symbol, limit))
+
+      columns = [description[0] for description in cursor.description]
+      trades = []
+
+      for row in cursor.fetchall():
+        trade_dict = dict(zip(columns, row))
+        trades.append(trade_dict)
+
+      return trades
+
+    except Exception as e:
+      print(f"Ошибка при получении сделок для символа {symbol}: {e}")
+      return []
 
 # ==============================================================================
 # ПРОДВИНУТАЯ ML СТРАТЕГИЯ С ENSEMBLE ПОДХОДОМ
@@ -311,13 +637,14 @@ class AdvancedDatabaseManager:
 class EnsembleMLStrategy:
   """Ensemble ML стратегия с автоматическим переобучением"""
 
-  def __init__(self, db_manager: AdvancedDatabaseManager):
+  def __init__(self, db_manager: AdvancedDatabaseManager, ml_model: LorentzianClassifier = None):
     self.strategy_name = "Ensemble_ML_Strategy"
     self.db_manager = db_manager
-    self.models = {}  # Словарь моделей для разных символов
+    self.models = ml_model
     self.performance_threshold = 0.6  # Минимальная точность для использования модели
     self.retrain_interval = 24 * 60 * 60  # 24 часа в секундах
     self.last_retrain = {}
+    self.models = {}
 
   def _prepare_features(self, data: pd.DataFrame) -> pd.DataFrame:
     """Подготавливает признаки для ML модели"""
@@ -430,73 +757,21 @@ class EnsembleMLStrategy:
       print(f"❌ Недостаточно данных для обучения {symbol} (нужно минимум 100)")
       return
 
-    # Простая имитация ensemble модели (в реальности здесь был бы sklearn)
-    class SimpleEnsembleModel:
-      def __init__(self):
-        self.is_fitted = False
-        self.feature_means = None
-        self.accuracy = 0.65  # Имитация точности
 
-      def fit(self, X, y):
-        self.feature_means = X.mean()
-        self.is_fitted = True
-        print(f"✅ Модель обучена на {len(X)} примерах")
-
-      def predict_proba(self, X):
-        if not self.is_fitted:
-          return None
-
-        # Простая логика на основе RSI и MACD
-        proba = np.zeros((len(X), 3))
-
-        for i, (_, row) in enumerate(X.iterrows()):
-          rsi = row.get('rsi', 50)
-          macd = row.get('macd', 0)
-          bb_percent = row.get('bb_percent', 0.5)
-
-          # BUY сигналы
-          if rsi < 30 and macd > 0 and bb_percent < 0.2:
-            proba[i] = [0.1, 0.8, 0.1]  # Высокая вероятность покупки
-          # SELL сигналы
-          elif rsi > 70 and macd < 0 and bb_percent > 0.8:
-            proba[i] = [0.1, 0.1, 0.8]  # Высокая вероятность продажи
-          # HOLD
-          else:
-            proba[i] = [0.8, 0.1, 0.1]  # Держать позицию
-
-        return proba
-
-      def predict(self, X):
-        proba = self.predict_proba(X)
-        return np.argmax(proba, axis=1) if proba is not None else None
-
-    # Создаем и обучаем модель
-    model = SimpleEnsembleModel()
-    model.fit(X, y)
-
-    # Сохраняем модель
-    self.models[symbol] = {
-      'model': model,
-      'feature_columns': feature_columns,
-      'accuracy': model.accuracy,
-      'trained_at': datetime.datetime.now()
-    }
-
-    self.last_retrain[symbol] = datetime.datetime.now()
-
-    # Сохраняем метрики в БД
-    metrics = {
-      'accuracy': model.accuracy,
-      'precision': 0.62,
-      'recall': 0.58,
-      'f1_score': 0.60
-    }
-
-    self.db_manager.update_model_performance(self.strategy_name, symbol, metrics)
-    print(f"✅ Ensemble модель для {symbol} обучена. Точность: {model.accuracy:.2%}")
 
   async def generate_signals(self, symbol: str, data: pd.DataFrame) -> Optional[TradingSignal]:
     """Генерирует торговые сигналы с использованием ensemble модели"""
+
+    if self.ml_model and self.ml_model.is_fitted:
+      features_df = self._prepare_features(data)
+      if features_df.empty:
+        return None
+
+      latest_features = features_df.tail(1)
+      prediction_proba = self.ml_model.predict_proba(latest_features)
+
+      if prediction_proba is None:
+        return await self._fallback_strategy(symbol, data)
 
     # Проверяем, нужно ли переобучить модель
     if await self.should_retrain(symbol):
@@ -509,11 +784,6 @@ class EnsembleMLStrategy:
 
     model_info = self.models[symbol]
     model = model_info['model']
-
-    # Подготавливаем признаки
-    features_df = self._prepare_features(data)
-    if features_df.empty:
-      return None
 
     # Получаем последнюю строку для предсказания
     latest_features = features_df[model_info['feature_columns']].fillna(0).tail(1)
@@ -655,7 +925,7 @@ class EnsembleMLStrategy:
 class AdvancedRiskManager:
   """Продвинутый риск-менеджер с динамическим управлением позициями"""
 
-  def __init__(self, db_manager: AdvancedDatabaseManager, connector: BybitConnector):
+  def __init__(self, db_manager: AdvancedDatabaseManager, connector: BybitConnector = None):
     self.connector = connector
     self.db_manager = db_manager
     self.max_daily_loss_percent = 0.02  # 2% от депозита в день
@@ -897,11 +1167,69 @@ class AdvancedRiskManager:
 
     return validation_result
 
-  async def _fetch_order_book(self, symbol: str) -> Dict:
-    """Интеграция с существующим методом через DataFetcher"""
-    # В реальной реализации здесь будет вызов к бирже через connector
-    return await self.connector.fetch_order_book(symbol)
+  async def _fetch_order_book(self, symbol: str, depth: int = 25) -> Dict[str, List]:
+    """
+    Получает стакан ордеров с биржи через connector
+    с обработкой ошибок и fallback-логикой
 
+    Args:
+        symbol: Торговый символ (например 'BTCUSDT')
+        depth: Глубина стакана (по умолчанию 25 уровней)
+
+    Returns:
+        Словарь с ключами 'bids' и 'asks', где каждый элемент - список [цена, объем]
+        Пример: {'bids': [[50000, 1.5], [49900, 2.3]], 'asks': [[50100, 2.1], [50200, 1.8]]}
+    """
+    try:
+      # Основной запрос через connector
+      orderbook = await self.connector.fetch_order_book(symbol, depth)
+
+      # Валидация структуры ответа
+      if not isinstance(orderbook, dict) or 'bids' not in orderbook or 'asks' not in orderbook:
+        raise ValueError("Некорректная структура стакана от биржи")
+
+      # Нормализация данных
+      normalized_bids = []
+      for bid in orderbook['bids']:
+        if len(bid) >= 2 and isinstance(bid[0], (int, float)) and isinstance(bid[1], (int, float)):
+          normalized_bids.append([float(bid[0]), float(bid[1])])
+
+      normalized_asks = []
+      for ask in orderbook['asks']:
+        if len(ask) >= 2 and isinstance(ask[0], (int, float)) and isinstance(ask[1], (int, float)):
+          normalized_asks.append([float(ask[0]), float(ask[1])])
+
+      logger.debug(f"Получен стакан для {symbol}: {len(normalized_bids)} bids, {len(normalized_asks)} asks")
+      return {
+        'bids': normalized_bids,
+        'asks': normalized_asks,
+        'timestamp': int(time.time() * 1000),  # Мс timestamp
+        'symbol': symbol
+      }
+
+    except Exception as e:
+      logger.error(f"Ошибка получения стакана для {symbol}: {str(e)}")
+
+      # Fallback: пытаемся получить через CCXT напрямую
+      try:
+        if hasattr(self.connector, 'exchange'):
+          ccxt_orderbook = await self.connector.exchange.fetch_order_book(symbol, limit=depth)
+          return {
+            'bids': ccxt_orderbook['bids'],
+            'asks': ccxt_orderbook['asks'],
+            'timestamp': ccxt_orderbook['timestamp'],
+            'symbol': symbol
+          }
+      except Exception as ccxt_e:
+        logger.error(f"CCXT fallback также failed для {symbol}: {str(ccxt_e)}")
+
+      # Ultimate fallback - пустой стакан
+      return {
+        'bids': [],
+        'asks': [],
+        'timestamp': int(time.time() * 1000),
+        'symbol': symbol
+      }
 
   async def _check_daily_loss(self, account_balance: float) -> Dict[str, Any]:
     """Проверяет, превышен ли дневной лимит потерь"""
@@ -957,31 +1285,73 @@ class AdvancedRiskManager:
       return account_balance * kelly_fraction
 
   async def update_risk_metrics(self, symbol: str = None):
-      """Обновляет риск-метрики в базе данных"""
-      risk_metrics = self.db_manager.get_risk_metrics(symbol, days=30)
+    """Обновить отображение риск-метрик"""
+    try:
+      if hasattr(self, 'trade_executor') and self.trade_executor:
+        symbols = getattr(self.trade_executor.trading_system, 'active_symbols', []) + [None]
+      else:
+        symbols = [None]
 
-      query = '''
-                INSERT INTO risk_metrics (
-                    timestamp, symbol, current_drawdown, max_drawdown, win_rate, 
-                    profit_factor, sharpe_ratio, daily_pnl
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            '''
+      self.risk_metrics_table.setRowCount(len(symbols))
 
-      try:
-        # Рассчитываем дополнительные метрики
-        max_drawdown = abs(risk_metrics.current_drawdown) * 1.2  # Примерное значение
-        profit_factor = abs(risk_metrics.avg_profit_loss) / 0.01 if risk_metrics.avg_profit_loss < 0 else 2.0
+      for row, symbol in enumerate(symbols):
+        # Получаем метрики
+        if hasattr(self, 'trade_executor') and hasattr(self.trade_executor, 'risk_manager'):
+          metrics = self.trade_executor.risk_manager.get_risk_metrics(symbol)
+        else:
+          metrics = None
 
-        self.db_manager.conn.execute(query, (
-          datetime.datetime.now(), symbol, risk_metrics.current_drawdown,
-          max_drawdown, risk_metrics.win_rate, profit_factor,
-          risk_metrics.sharpe_ratio, risk_metrics.avg_profit_loss
-        ))
-        self.db_manager.conn.commit()
+        # Безопасное заполнение таблицы
+        symbol_text = symbol if symbol else "Общие"
+        self.risk_metrics_table.setItem(row, 0, QTableWidgetItem(symbol_text))
 
-        print(f"✅ Риск-метрики обновлены для {symbol or 'всех символов'}")
-      except sqlite3.Error as e:
-        print(f"❌ Ошибка обновления риск-метрик: {e}")
+        if metrics:
+          # Безопасное получение атрибутов с значениями по умолчанию
+          win_rate = getattr(metrics, 'win_rate', 0.0)
+          max_drawdown = getattr(metrics, 'max_drawdown', 0.0)
+          profit_factor = getattr(metrics, 'profit_factor', 0.0)
+          total_pnl = getattr(metrics, 'total_pnl', 0.0)
+          sharpe_ratio = getattr(metrics, 'sharpe_ratio', 0.0)
+
+          self.risk_metrics_table.setItem(row, 1, QTableWidgetItem(f"{win_rate:.1%}"))
+          self.risk_metrics_table.setItem(row, 2, QTableWidgetItem(f"{max_drawdown:.2%}"))
+          self.risk_metrics_table.setItem(row, 3, QTableWidgetItem(f"{profit_factor:.2f}"))
+          self.risk_metrics_table.setItem(row, 4, QTableWidgetItem(f"{total_pnl:.2f}"))
+          self.risk_metrics_table.setItem(row, 5, QTableWidgetItem(f"{sharpe_ratio:.2f}"))
+        else:
+          # Заполняем пустыми значениями
+          for col in range(1, 6):
+            self.risk_metrics_table.setItem(row, col, QTableWidgetItem("N/A"))
+
+    except Exception as e:
+      print(f"Ошибка при обновлении риск-метрик: {e}")
+
+
+      # """Обновляет риск-метрики в базе данных"""
+      # risk_metrics = self.db_manager.get_risk_metrics(symbol, days=30)
+      #
+      # query = '''
+      #           INSERT INTO risk_metrics (
+      #               timestamp, symbol, current_drawdown, max_drawdown, win_rate,
+      #               profit_factor, sharpe_ratio, daily_pnl
+      #           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      #       '''
+      #
+      # try:
+      #   # Рассчитываем дополнительные метрики
+      #   max_drawdown = abs(risk_metrics.current_drawdown) * 1.2  # Примерное значение
+      #   profit_factor = abs(risk_metrics.avg_profit_loss) / 0.01 if risk_metrics.avg_profit_loss < 0 else 2.0
+      #
+      #   self.db_manager.conn.execute(query, (
+      #     datetime.datetime.now(), symbol, risk_metrics.current_drawdown,
+      #     max_drawdown, risk_metrics.win_rate, profit_factor,
+      #     risk_metrics.sharpe_ratio, risk_metrics.avg_profit_loss
+      #   ))
+      #   self.db_manager.conn.commit()
+      #
+      #   print(f"✅ Риск-метрики обновлены для {symbol or 'всех символов'}")
+      # except sqlite3.Error as e:
+      #   print(f"❌ Ошибка обновления риск-метрик: {e}")
 
   # ==============================================================================
   # ИНТЕГРИРОВАННАЯ ТОРГОВАЯ СИСТЕМА
@@ -996,20 +1366,24 @@ class SignalProcessor:
       return await self.risk_manager.validate_signal(signal, symbol, balance)
 
 
-# class TradeExecutor:
-#   """Отдельный исполнитель торговых ордеров"""
-#
-#   def __init__(self, db_manager: AdvancedDatabaseManager):
-#     self.db_manager = db_manager
-#
-#   async def execute_order(self, trade_decision: Dict[str, Any]) -> bool:
-#     # Логика исполнения ордера
-#     signal = trade_decision['signal']
-#     order_id = trade_decision['order_id']
-#     quantity = trade_decision['recommended_size']
-#
-#     trade_id = self.db_manager.add_trade_with_signal(signal, order_id, quantity)
-#     return trade_id is not None
+class TradeExecutor:
+  """Отдельный исполнитель торговых ордеров"""
+
+  def __init__(self, db_manager: AdvancedDatabaseManager):
+    self.db_manager = db_manager
+
+  async def execute_order(self, trade_decision: Dict[str, Any]) -> bool:
+    # Логика исполнения ордера
+    orderbook = await self._fetch_order_book(symbol)
+
+    if not orderbook['bids'] or not orderbook['asks']:
+      raise Exception(f"Не удалось получить стакан для {symbol}")
+    signal = trade_decision['signal']
+    order_id = trade_decision['order_id']
+    quantity = trade_decision['recommended_size']
+
+    trade_id = self.db_manager.add_trade_with_signal(signal, order_id, quantity)
+    return trade_id is not None
 
 
 class MLFeedbackLoop:
@@ -1037,18 +1411,33 @@ class MLFeedbackLoop:
 class IntegratedTradingSystem:
     """Главная интегрированная торговая система"""
 
-    def __init__(self, db_path: str = "advanced_trading.db"):
-      self.db_manager = AdvancedDatabaseManager(db_path)
-      self.ml_strategy = EnsembleMLStrategy(self.db_manager)
-      self.risk_manager = AdvancedRiskManager(self.db_manager)
+    def __init__(self, db_manager: AdvancedDatabaseManager = None,
+                 db_path: str = "advanced_trading.db",
+                 connector=None, ml_model=None):
+    #def __init__(self, db_path: str = "advanced_trading.db"):
+      if db_manager is not None:
+        self.db_manager = db_manager
+      else:
+        # Иначе создаем новый по пути
+        self.db_manager = AdvancedDatabaseManager(db_path)
+
+      self.connector = connector
+      self.strategy_name = "IntegratedTradingSystem"  # Добавляем имя стратегии
+
+      self.ml_strategy = EnsembleMLStrategy(self.db_manager, ml_model=ml_model)
+      self.risk_manager = AdvancedRiskManager(self.db_manager, connector=None)
 
       self.signal_processor = SignalProcessor(self.risk_manager)
-      self.trade_executor = TradeExecutor(self.db_manager)
+      # self.trade_executor = TradeExecutor(self.db_manager)
       self.ml_feedback = MLFeedbackLoop(self.db_manager, self.ml_strategy)
 
       self.active_symbols = []
       self.account_balance = 10000.0  # Начальный баланс
       self.running = False
+
+      self.active_strategies = {
+            "Ensemble_ML_Strategy": self.ml_strategy
+        }
 
     async def add_symbol(self, symbol: str):
       """Добавляет символ для торговли"""
@@ -1063,30 +1452,36 @@ class IntegratedTradingSystem:
         print(f"❌ Символ {symbol} удален из торговой системы")
 
     async def process_market_data(self, symbol: str, data: pd.DataFrame) -> Optional[Dict[str, Any]]:
-      """Обрабатывает рыночные данные и генерирует торговые решения"""
+      """Обрабатывает рыночные данные через активные стратегии и генерирует торговые решения"""
 
       if symbol not in self.active_symbols:
         return None
 
-      try:
-        # 1. Генерируем сигнал
-        signal = await self.ml_strategy.generate_signals(symbol, data)
+      trade_decisions = []
 
-        if not signal:
-          return {'action': 'no_signal', 'symbol': symbol}
+      # Обрабатываем данные через все активные стратегии
+      for strategy_name, strategy in self.active_strategies.items():
+        try:
+          # Генерируем сигнал через текущую стратегию
+          signal = await strategy.generate_signals(symbol, data)
 
-        # 2. Валидируем сигнал через риск-менеджер
-        validation = await self.risk_manager.validate_signal(signal, symbol, self.account_balance)
+          if not signal:
+            trade_decisions.append({'action': 'no_signal', 'symbol': symbol, 'strategy': strategy_name})
+            continue
 
-        # if not validation['approved']:
-        #   print(f"⚠️ Сигнал для {symbol} отклонен: {', '.join(validation['reasons'])}")
-        #   return {
-        #     'action': 'signal_rejected',
-        #     'symbol': symbol,
-        #     'signal': signal,
-        #     'validation': validation
-        #   }
-        if validation['approved']:
+          # Валидируем сигнал через риск-менеджер
+          validation = await self.risk_manager.validate_signal(signal, symbol, self.account_balance)
+
+          if not validation['approved']:
+            trade_decisions.append({
+              'action': 'signal_rejected',
+              'symbol': symbol,
+              'strategy': strategy_name,
+              'signal': signal,
+              'validation': validation
+            })
+            continue
+
           # Проверяем ликвидность перед исполнением
           if validation['liquidity_metrics']['impact'] > 0.2:
             logger.warning(f"Высокое рыночное воздействие для {symbol}. Используем TWAP стратегию")
@@ -1094,35 +1489,60 @@ class IntegratedTradingSystem:
           else:
             await self.execute_market_order(signal, validation)
 
+          # Создаем торговое решение
+          trade_decision = {
+            'action': 'execute_trade',
+            'symbol': symbol,
+            'strategy': strategy_name,
+            'signal': signal,
+            'validation': validation,
+            'recommended_size': validation['recommended_size'],
+            'risk_score': validation['risk_score'],
+            'order_id': f"{symbol}_{strategy_name}_{int(datetime.datetime.now().timestamp())}"
+          }
 
-        # 3. Создаем торговое решение
-        trade_decision = {
-          'action': 'execute_trade',
-          'symbol': symbol,
-          'signal': signal,
-          'validation': validation,
-          'recommended_size': validation['recommended_size'],
-          'risk_score': validation['risk_score'],
-          'order_id': f"{symbol}_{int(datetime.datetime.now().timestamp())}"
-        }
+          logger.info(f"🎯 Торговое решение для {symbol} (стратегия {strategy_name}):")
+          logger.info(f"   Действие: {signal.signal.value}")
+          logger.info(f"   Размер: {validation['recommended_size']:.6f}")
+          logger.info(f"   Уверенность: {signal.confidence:.2%}")
+          logger.info(f"   Риск-счет: {validation['risk_score']:.2%}")
 
-        print(f"🎯 Торговое решение для {symbol}:")
-        print(f"   Действие: {signal.signal.value}")
-        print(f"   Размер: {validation['recommended_size']:.6f}")
-        print(f"   Уверенность: {signal.confidence:.2%}")
-        print(f"   Риск-счет: {validation['risk_score']:.2%}")
+          trade_decisions.append(trade_decision)
 
-        return trade_decision
+        except Exception as e:
+          logger.error(f"❌ Ошибка обработки данных для {symbol} стратегией {strategy_name}: {e}")
+          trade_decisions.append({
+            'action': 'error',
+            'symbol': symbol,
+            'strategy': strategy_name,
+            'error': str(e)
+          })
 
-      except Exception as e:
-        print(f"❌ Ошибка обработки данных для {symbol}: {e}")
-        return {'action': 'error', 'symbol': symbol, 'error': str(e)}
+      # Возвращаем все решения по стратегиям
+      return trade_decisions
+
+    def add_strategy(self, strategy: BaseStrategy):
+        """Добавляет стратегию в торговую систему"""
+        if strategy_name not in self.active_strategies:
+          self.active_strategies[strategy_name] = strategy_instance
+          logger.info(f"Стратегия '{strategy_name}' добавлена в систему")
+
+    def remove_strategy(self, strategy_name: str):
+      """Удаляет стратегию из системы"""
+      if strategy_name in self.active_strategies:
+        del self.active_strategies[strategy_name]
+        logger.info(f"Стратегия '{strategy_name}' удалена из системы")
+
+
 
     async def execute_trade_decision(self, trade_decision: Dict[str, Any]) -> bool:
-      """Выполняет торговое решение"""
+      """Выполняет торговое решение с учетом стратегии"""
 
       if trade_decision['action'] != 'execute_trade':
         return False
+      strategy_name = trade_decision.get('strategy', 'Unknown')
+      signal = trade_decision['signal']
+      signal.metadata['strategy'] = strategy_name
 
       signal = trade_decision['signal']
       order_id = trade_decision['order_id']

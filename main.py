@@ -11,15 +11,13 @@ from logger_setup import setup_logging, get_logger
 import config  # Загрузка конфигурации
 from core.bybit_connector import BybitConnector
 from core.data_fetcher import DataFetcher
-from core.database_manager_new import AdvancedDatabaseManager
-# from core.database_manager import DatabaseManager
+from core.database_manager_new import AdvancedDatabaseManager, IntegratedTradingSystem
 from core.trade_executor import TradeExecutor
 from core.monitoring_service import MonitoringService
 from ml_models.lorentzian_classifier import LorentzianClassifier  # и его обучение/загрузка
 from strategies.MultiIndicatorStrategy import MultiIndicatorStrategy
 from strategies.rsi_ml_strategy import RsiMlStrategy
 from strategies.ma_crossover_strategy import MACrossoverStrategy
-# from strategies.bollinger_bands_strategy import
 from strategies.base_strategy import BaseStrategy
 from config import TELEGRAM_TOKEN,TELEGRAM_CHAT_ID
 from gui.main_window import MainWindow  # Наше GUI
@@ -46,7 +44,7 @@ main_window:[MainWindow] = None  # Для GUI
 app:[QApplication] = None  # Для GUI
 
 
-async def process_symbol_strategy(symbol: str, strategy: BaseStrategy, fetcher: DataFetcher, executor: TradeExecutor):
+async def process_symbol_strategy(symbol: str, strategy: IntegratedTradingSystem, fetcher: DataFetcher, executor: TradeExecutor):
   """
   Асинхронная задача для обработки одной стратегии для одного символа.
   Эта функция будет запускаться для каждого символа из "Списка №1".
@@ -71,7 +69,7 @@ async def process_symbol_strategy(symbol: str, strategy: BaseStrategy, fetcher: 
       if 'low' not in market_data_df.columns: market_data_df['low'] = market_data_df['close']
 
       # 2. Сгенерировать сигнал
-      signal_info = await strategy.generate_signals(symbol, market_data_df)
+      signal_info = await strategy.process_market_data(symbol, market_data_df)
 
       if signal_info:
         logger.info(f"[{strategy.strategy_name}/{symbol}] Получен сигнал: {signal_info}")
@@ -117,6 +115,24 @@ async def process_symbol_strategy(symbol: str, strategy: BaseStrategy, fetcher: 
     logger.error(f"Ошибка в обработке стратегии '{strategy.strategy_name}' для {symbol}: {e}", exc_info=True)
     # Здесь можно добавить логику перезапуска задачи или уведомления
 
+async def model_retraining_task():
+    while True:
+      try:
+        # Получаем свежие данные
+        data = await data_fetcher.get_historical_data(symbols=tracked_symbols_list, timeframe='1d', limit=1000)
+
+        # Подготовка данных
+        X, y = create_features_and_labels(data)  # Нужно реализовать эту функцию
+
+        if X is not None and y is not None:
+          ml_model.fit(X, y)
+          ml_model.save_model("ml_models/trained_lorentzian_model.pkl")
+          logger.info("Модель успешно переобучена")
+
+      except Exception as e:
+        logger.error(f"Ошибка переобучения модели: {e}")
+
+      await asyncio.sleep(24 * 60 * 60)  # Раз в сутки
 
 async def on_monitored_list_updated(updated_symbols: List[str]):
   """
@@ -146,8 +162,8 @@ async def on_monitored_list_updated(updated_symbols: List[str]):
   # Запускаем задачи для новых символов
   # Предположим, мы используем одну и ту же основную стратегию для всех символов из списка №1
   # В будущем можно будет назначать разные стратегии разным символам.
-  main_strategy_name = "RSI_ML_Strategy"  # или другая выбранная стратегия
-
+  # main_strategy_name = "RSI_ML_Strategy"  # или другая выбранная стратегия
+  main_strategy_name = "trading_system"
   if main_strategy_name not in strategy_instances:
     logger.error(f"MAIN: Основная стратегия '{main_strategy_name}' не найдена в экземплярах стратегий!")
     return
@@ -172,7 +188,7 @@ def get_current_monitored_symbols() -> List[str]:
 
 async def main_async():
   """Основная асинхронная функция для запуска логики бота."""
-  global logger, bybit_connector, data_fetcher, db_manager, trade_executor, ml_model
+  global logger, bybit_connector, data_fetcher, db_manager, trade_executor, ml_model, trading_system
   global strategy_instances, monitoring_service, main_window, app
 
 
@@ -202,16 +218,19 @@ async def main_async():
   # 2. Инициализация и обучение/загрузка ML модели
   # ВАЖНО: Этот этап требует реальных данных и процесса обучения.
   # Сейчас это заглушка.
-  ml_model = LorentzianClassifier(n_neighbors=8)  # Параметры из конфига или по умолчанию
+  ml_model = LorentzianClassifier(k_neighbors=8)  # Параметры из конфига или по умолчанию
   try:
     # Попытка загрузить предобученную модель
-    # ml_model.load_model("path/to/your/trained_lorentzian_model.pkl")
-    logger.info("ML модель (LorentzianClassifier-заглушка) инициализирована. Пропустите обучение для примера.")
+    ml_model.load_model("ml_models/trained_lorentzian_model.pkl")
+    logger.info("ML модель (LorentzianClassifier) инициализирована.")
+
+
+
     # Если нет обученной, то нужно обучить (требует данных)
     # X_train, y_train = await data_fetcher.get_training_data_for_ml() # Гипотетический метод
     # if X_train is not None and y_train is not None:
     #    ml_model.fit(X_train, y_train)
-    #    logger.info("ML модель обучена.")
+    # logger.info("ML модель обучена.")
     # else:
     #    logger.warning("Не удалось получить данные для обучения ML модели.")
     # Для примера, "обучим" заглушку, если она не была "обучена" при инициализации
@@ -230,13 +249,19 @@ async def main_async():
 
 
   except Exception as e:
-    logger.error(f"Ошибка при инициализации/обучении ML модели: {e}", exc_info=True)
+    logger.error(f"Ошибка загрузки модели: {e}. Создаем новую.", exc_info=True)
     # Решить, может ли бот работать без ML модели или с базовой логикой
+
+  trading_system = IntegratedTradingSystem(
+    db_manager=db_manager,
+    ml_model=ml_model  # Передаём модель
+  )
 
   # 3. Инициализация экземпляров стратегий
   strategy_instances["RSI_ML_Strategy"] = RsiMlStrategy(ml_model=ml_model)
   strategy_instances["MA_Crossover"] = MACrossoverStrategy(params={"short_ma_period": 10, "long_ma_period": 30})
   strategy_instances["MultiIndicatorStrategy"] = MultiIndicatorStrategy(params={})
+  strategy_instances["trading_system"] = IntegratedTradingSystem(db_path=config.DATABASE_PATH)
   # ... инициализация других стратегий ...
   logger.info(f"Загружено {len(strategy_instances)} стратегий: {list(strategy_instances.keys())}")
 

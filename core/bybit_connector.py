@@ -454,21 +454,49 @@ class BybitConnector:
           logger.error(f"Ошибка при установке кредитного плеча для {symbol}: {e}")
           raise
 
-  async def fetch_order_book(self, symbol: str, depth: int = 25) -> Dict[str, List]:
-    """Получает стакан ордеров с биржи"""
+  async def fetch_order_book(self, symbol: str, depth: int = 25) -> Dict:
+    """Полная реализация получения стакана"""
     try:
-      if not self.exchange:
-        logger.error("CCXT exchange не инициализирован")
-        return {'bids': [], 'asks': []}
-
-      orderbook = await self.exchange.fetch_order_book(symbol, limit=depth)
-      return {
-        'bids': [[price, amount] for price, amount in orderbook['bids']],
-        'asks': [[price, amount] for price, amount in orderbook['asks']]
+      # Прямой API запрос к Bybit v5
+      endpoint = "/v5/market/orderbook"
+      params = {
+        "symbol": symbol,
+        "category": BYBIT_CATEGORY,
+        "limit": depth
       }
+
+      response = await self._request("GET", endpoint, params)
+      if not response or 'bids' not in response:
+        raise ValueError("Invalid orderbook response")
+
+      return {
+        'bids': [[float(b[0]), float(b[1])] for b in response['bids']],
+        'asks': [[float(a[0]), float(a[1])] for a in response['asks']],
+        'timestamp': response.get('ts', int(time.time() * 1000))
+      }
+
     except Exception as e:
-      logger.error(f"Ошибка получения стакана для {symbol}: {e}")
-      return {'bids': [], 'asks': []}
+      logger.error(f"Orderbook fetch error: {str(e)}")
+      # Fallback через CCXT
+      if hasattr(self, 'exchange'):
+        return await self.exchange.fetch_order_book(symbol, limit=depth)
+      raise
+
+  # async def fetch_order_book(self, symbol: str, depth: int = 25) -> Dict[str, List]:
+  #   """Получает стакан ордеров с биржи"""
+  #   try:
+  #     if not self.exchange:
+  #       logger.error("CCXT exchange не инициализирован")
+  #       return {'bids': [], 'asks': []}
+  #
+  #     orderbook = await self.exchange.fetch_order_book(symbol, limit=depth)
+  #     return {
+  #       'bids': [[price, amount] for price, amount in orderbook['bids']],
+  #       'asks': [[price, amount] for price, amount in orderbook['asks']]
+  #     }
+  #   except Exception as e:
+  #     logger.error(f"Ошибка получения стакана для {symbol}: {e}")
+  #     return {'bids': [], 'asks': []}
 
 
   async def get_kline(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:

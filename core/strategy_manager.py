@@ -1,3 +1,7 @@
+import pandas as pd
+
+import config
+from core.database_manager_new import IntegratedTradingSystem
 from strategies.MultiIndicatorStrategy import MultiIndicatorStrategy
 
 from typing import Callable, Dict, List
@@ -10,8 +14,16 @@ class StrategyManager:
         self.strategies: Dict[str, Dict[str, BaseStrategy]] = {}
         self.trade_executor = trade_executor
         # global signal handler callback: symbol, signal_info
-        self.signal_callback: Callable[[str, Dict], None] = None
-
+        # self.signal_callback: Callable[[str, Dict], None] = None
+        self.trading_system = IntegratedTradingSystem(
+            db_manager=trade_executor.db_manager,  # Используем существующий db_manager
+            connector=trade_executor.connector
+        )
+        #__________________________________
+        #     db_path=config.DATABASE_PATH,
+        #     connector=trade_executor.connector
+        # )
+        #________________________________________
     def set_signal_callback(self, callback: Callable[[str, Dict], None]):
         self.signal_callback = callback
 
@@ -32,24 +44,34 @@ class StrategyManager:
 
     def get_active_symbols(self) -> List[str]:
         return [sym for sym, st in self.strategies.items() if st]
+#---------------------------прошлая реализация async def process_market_data-
+    # async def process_market_data(self, symbol: str, data):
+    #     # For each registered strategy on this symbol
+    #     if symbol in self.strategies:
+    #         for strat in self.strategies[symbol].values():
+    #             signal = await strat.generate_signals(symbol, data)
+    #             if signal:
+    #                 # pass to executor
+    #                 self.trade_executor.execute_trade(
+    #                     symbol=symbol,
+    #                     side=signal['signal'],
+    #                     quantity=signal.get('quantity', 0.001),
+    #                     strategy_name=strat.strategy_name,
+    #                     order_type=signal.get('order_type', 'Market'),
+    #                     price=signal.get('price'),
+    #                     stop_loss=signal.get('stop_loss'),
+    #                     take_profit=signal.get('take_profit')
+    #                 )
+    #                 # notify any listeners
+    #                 if self.signal_callback:
+    #                     self.signal_callback(symbol, signal)
+#-----------------------------------------------------------------------------
+    async def process_market_data(self, symbol: str, data: pd.DataFrame):
+        """Обработка данных через интегрированную систему"""
+        if symbol not in self.trading_system.active_symbols:
+            return
 
-    async def process_market_data(self, symbol: str, data):
-        # For each registered strategy on this symbol
-        if symbol in self.strategies:
-            for strat in self.strategies[symbol].values():
-                signal = await strat.generate_signals(symbol, data)
-                if signal:
-                    # pass to executor
-                    self.trade_executor.execute_trade(
-                        symbol=symbol,
-                        side=signal['signal'],
-                        quantity=signal.get('quantity', 0.001),
-                        strategy_name=strat.strategy_name,
-                        order_type=signal.get('order_type', 'Market'),
-                        price=signal.get('price'),
-                        stop_loss=signal.get('stop_loss'),
-                        take_profit=signal.get('take_profit')
-                    )
-                    # notify any listeners
-                    if self.signal_callback:
-                        self.signal_callback(symbol, signal)
+        decision = await self.trading_system.process_market_data(symbol, data)
+
+        if decision and decision['action'] == 'execute_trade':
+            await self.trade_executor.execute_trade_decision(decision)

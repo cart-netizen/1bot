@@ -2,8 +2,9 @@ from datetime import datetime, timezone
 
 import ccxt
 
+import config
 from core.bybit_connector import BybitConnector
-from core.database_manager_new import AdvancedDatabaseManager
+from core.database_manager_new import AdvancedDatabaseManager, IntegratedTradingSystem, TradingSignal
 # from core.database_manager import DatabaseManager
 from logger_setup import get_logger
 from config import LEVERAGE  # Глобальное плечо по умолчанию
@@ -17,150 +18,176 @@ class TradeExecutor:
     self.connector = connector
     self.db_manager = db_manager
     self.telegram_bot = telegram_bot
+    self.trading_system = IntegratedTradingSystem(db_manager=db_manager)
 
-  async def execute_trade(self, symbol: str, side: str, quantity: float, strategy_name: str,
-                          order_type: str = "Market", price: [float] = None, leverage: int = LEVERAGE,
-                          stop_loss: [float] = None, take_profit: [float] = None) -> [str]:
-    """
-    Исполняет торговый приказ (открытие позиции).
 
-    Args:
-        symbol (str): Торговый символ.
-        side (str): 'buy' или 'sell'.
-        quantity (float): Количество для покупки/продажи.
-        strategy_name (str): Название стратегии, сгенерировавшей сигнал.
-        order_type (str): 'Market' или 'Limit'.
-        price (Optional[float]): Цена для Limit ордера.
-        leverage (int): Кредитное плечо.
-        stop_loss (Optional[float]): Цена Stop Loss.
-        take_profit (Optional[float]): Цена Take Profit.
-
-    Returns:
-        Optional[str]: ID ордера на бирже в случае успеха, иначе None.
-    """
-    logger.info(f"Попытка исполнить сделку: {symbol} {side} {quantity} @ {price if price else 'Market'}, "
-                f"Strategy: {strategy_name}, Leverage: {leverage}x")
-    #self.log(f"Попытка разместить ордер: {symbol} | {side} | amount={quantity} | price={price or 'market'}")
-
-    # 1. Установка кредитного плеча (если оно не установлено глобально или отличается)
-    # Bybit требует установку плеча перед размещением ордера для пары.
-    # Этот вызов может быть избыточным, если плечо уже установлено и не меняется.
-    # Можно добавить проверку текущего плеча или управлять этим более гранулярно.
-    # ВАЖНО: set_leverage должно быть вызвано до create_order
-    leverage_set = await self.connector.set_leverage(symbol, leverage)
-    if not leverage_set:  # или если leverage_set вернул ошибку
-      # Некоторые реализации set_leverage в ccxt могут не возвращать тело ответа, а просто не кидать исключение
-      # Проверяем более тщательно
-      logger.warning(
-        f"Не удалось подтвердить установку плеча {leverage}x для {symbol}, но продолжаем с размещением ордера.")
-      # В критических системах, если set_leverage не подтвердилось, лучше не продолжать.
-
-    # 2. Подготовка параметров ордера, включая SL/TP для Bybit API v5
-    params = {'category': self.connector.exchange.options.get('defaultType', 'linear')}  # 'linear' или 'inverse'
-    if order_type.lower() == 'market':
-      price = None  # Для рыночного ордера цена не указывается
-
-    if stop_loss:
-      params['stopLoss'] = str(stop_loss)
-      # Для Bybit может потребоваться 'slTriggerBy': 'MarkPrice' или 'LastPrice'
-      # params['slTriggerBy'] = 'MarkPrice'
-    if take_profit:
-      params['takeProfit'] = str(take_profit)
-      # params['tpTriggerBy'] = 'MarkPrice'
-
-    # 3. Размещение ордера через BybitConnector
+  async def execute_trade(self, signal: TradingSignal, symbol: str, quantity: float):
+    """Исполняет торговый сигнал через интегрированную систему"""
     try:
-      order_response = await self.connector.place_order(
-        symbol=symbol,
-        side=side.lower(),
-        order_type=order_type.lower(),
-        amount=quantity,
-        price=price,
-        params=params
+      # Создаем order_id
+      order_id = f"{symbol}_{int(datetime.now().timestamp())}"
+
+      # Добавляем сделку через AdvancedDatabaseManager
+      trade_id = self.db_manager.add_trade_with_signal(
+        signal=signal,
+        order_id=order_id,
+        quantity=quantity,
+        leverage=config.LEVERAGE
       )
 
-      if order_response and 'id' in order_response:
-        order_id = order_response['id']
-        open_price = float(
-          order_response.get('price', 0.0))  # Для рыночных ордеров цена исполнения будет в 'average' или 'filledPrice'
-
-        # Если это рыночный ордер, цена исполнения может быть не сразу известна или отличаться.
-        # Bybit часто возвращает 0 в поле 'price' для рыночных ордеров в ответе create_order.
-        # Реальную цену исполнения нужно будет получить из fetch_order(order_id) или из WebSocket обновлений.
-        # Для простоты здесь используем то, что вернулось, или цену запроса для лимитных.
-        if order_type.lower() == 'market' and order_response.get('average'):
-          actual_open_price = float(order_response['average'])
-        elif order_type.lower() == 'limit' and order_response.get('price'):
-          actual_open_price = float(order_response['price'])
-        else:  # Запасной вариант или если цена не пришла сразу
-          actual_open_price = price if price else 0.0  # Нужна лучшая логика для рыночных
-          logger.warning(
-            f"Цена открытия для ордера {order_id} не была четко определена в ответе: {order_response}. Используется {actual_open_price}")
-
-        logger.info(f"Ордер {order_id} ({symbol} {side} {quantity}) успешно размещен. "
-                    f"Цена открытия (приблизительно): {actual_open_price}")
-
-        if "error" in order_response:
-          msg = f"⚠️ Ордер {side} {symbol} НЕ размещен: {result['error']}"
-          self.log(msg, level="warning")
-          await self.notify(msg)
-          return False
-
-        if "order" in order_response:
-          order_data = order_response["order"]
-          msg = (
-            f"✅ Ордер размещен: {side.upper()} {symbol}\n"
-            f"📦 Кол-во: {order_data['amount']}\n"
-            f"💵 Цена: {order_data.get('price', 'market')}\n"
-            f"🆔 ID: {order_data.get('id')}"
-          )
-          self.log(msg)
-          await self.notify(msg)
-
-          return True
-        self.log(f"⚠️ Неизвестный результат от биржи для {symbol}", level="warning")
-
-        # 4. Запись информации об открытой сделке в БД
-        self.db_manager.add_open_trade(
-          symbol=symbol,
-          order_id=order_id,
-          strategy=strategy_name,
-          side=side.lower(),
-          open_timestamp=datetime.now(timezone.utc),  # Используем UTC
-          open_price=actual_open_price,  # Здесь должна быть фактическая цена исполнения
-          quantity=quantity,
-          leverage=leverage
-        )
-        return order_id
-      else:
-        logger.error(f"Не удалось разместить ордер для {symbol} {side}. Ответ API: {order_response}")
-
-    except RuntimeError as e:
-      if "Недостаточно средств" in str(e):
-        msg = f"❌ {symbol} | Ордер не выполнен: Недостаточно средств"
-        self.log(msg, level="error")
-        await self.notify(msg)
-        return False
-
-
+      if trade_id:
+        # Логируем исполненный сигнал
+        self.db_manager.log_signal(signal, symbol, executed=True)
+        return True
+      return False
     except Exception as e:
-      self.log(f"‼️ Неизвестная ошибка при торговле {symbol}: {e}", level="error")
-      await self.notify(f"⚠️ Ошибка при размещении ордера {symbol}: {e}")
+      logger.error(f"Ошибка исполнения сделки: {e}")
       return False
 
-  def log(self, message: str, level="info"):
-      logger_method = getattr(self.connector.logger, level, self.connector.logger.info)
-      logger_method(message)
-
-  async def notify(self, message: str):
-    if self.telegram_bot:
-      # try:
-        await self.telegram_bot.send_message(message)
-      # except Exception as e:
-      #   self.connector.logger.warning(f"Ошибка при отправке сообщения в Telegram: {e}")
-
-
-
+#--------прошлая реализация async def execute_trade---------
+  # async def execute_trade(self, symbol: str, side: str, quantity: float, strategy_name: str,
+  #                         order_type: str = "Market", price: [float] = None, leverage: int = LEVERAGE,
+  #                         stop_loss: [float] = None, take_profit: [float] = None) -> [str]:
+  #   """
+  #   Исполняет торговый приказ (открытие позиции).
+  #
+  #   Args:
+  #       symbol (str): Торговый символ.
+  #       side (str): 'buy' или 'sell'.
+  #       quantity (float): Количество для покупки/продажи.
+  #       strategy_name (str): Название стратегии, сгенерировавшей сигнал.
+  #       order_type (str): 'Market' или 'Limit'.
+  #       price (Optional[float]): Цена для Limit ордера.
+  #       leverage (int): Кредитное плечо.
+  #       stop_loss (Optional[float]): Цена Stop Loss.
+  #       take_profit (Optional[float]): Цена Take Profit.
+  #
+  #   Returns:
+  #       Optional[str]: ID ордера на бирже в случае успеха, иначе None.
+  #   """
+  #   logger.info(f"Попытка исполнить сделку: {symbol} {side} {quantity} @ {price if price else 'Market'}, "
+  #               f"Strategy: {strategy_name}, Leverage: {leverage}x")
+  #   #self.log(f"Попытка разместить ордер: {symbol} | {side} | amount={quantity} | price={price or 'market'}")
+  #
+  #   # 1. Установка кредитного плеча (если оно не установлено глобально или отличается)
+  #   # Bybit требует установку плеча перед размещением ордера для пары.
+  #   # Этот вызов может быть избыточным, если плечо уже установлено и не меняется.
+  #   # Можно добавить проверку текущего плеча или управлять этим более гранулярно.
+  #   # ВАЖНО: set_leverage должно быть вызвано до create_order
+  #   leverage_set = await self.connector.set_leverage(symbol, leverage)
+  #   if not leverage_set:  # или если leverage_set вернул ошибку
+  #     # Некоторые реализации set_leverage в ccxt могут не возвращать тело ответа, а просто не кидать исключение
+  #     # Проверяем более тщательно
+  #     logger.warning(
+  #       f"Не удалось подтвердить установку плеча {leverage}x для {symbol}, но продолжаем с размещением ордера.")
+  #     # В критических системах, если set_leverage не подтвердилось, лучше не продолжать.
+  #
+  #   # 2. Подготовка параметров ордера, включая SL/TP для Bybit API v5
+  #   params = {'category': self.connector.exchange.options.get('defaultType', 'linear')}  # 'linear' или 'inverse'
+  #   if order_type.lower() == 'market':
+  #     price = None  # Для рыночного ордера цена не указывается
+  #
+  #   if stop_loss:
+  #     params['stopLoss'] = str(stop_loss)
+  #     # Для Bybit может потребоваться 'slTriggerBy': 'MarkPrice' или 'LastPrice'
+  #     # params['slTriggerBy'] = 'MarkPrice'
+  #   if take_profit:
+  #     params['takeProfit'] = str(take_profit)
+  #     # params['tpTriggerBy'] = 'MarkPrice'
+  #
+  #   # 3. Размещение ордера через BybitConnector
+  #   try:
+  #     order_response = await self.connector.place_order(
+  #       symbol=symbol,
+  #       side=side.lower(),
+  #       order_type=order_type.lower(),
+  #       amount=quantity,
+  #       price=price,
+  #       params=params
+  #     )
+  #
+  #     if order_response and 'id' in order_response:
+  #       order_id = order_response['id']
+  #       open_price = float(
+  #         order_response.get('price', 0.0))  # Для рыночных ордеров цена исполнения будет в 'average' или 'filledPrice'
+  #
+  #       # Если это рыночный ордер, цена исполнения может быть не сразу известна или отличаться.
+  #       # Bybit часто возвращает 0 в поле 'price' для рыночных ордеров в ответе create_order.
+  #       # Реальную цену исполнения нужно будет получить из fetch_order(order_id) или из WebSocket обновлений.
+  #       # Для простоты здесь используем то, что вернулось, или цену запроса для лимитных.
+  #       if order_type.lower() == 'market' and order_response.get('average'):
+  #         actual_open_price = float(order_response['average'])
+  #       elif order_type.lower() == 'limit' and order_response.get('price'):
+  #         actual_open_price = float(order_response['price'])
+  #       else:  # Запасной вариант или если цена не пришла сразу
+  #         actual_open_price = price if price else 0.0  # Нужна лучшая логика для рыночных
+  #         logger.warning(
+  #           f"Цена открытия для ордера {order_id} не была четко определена в ответе: {order_response}. Используется {actual_open_price}")
+  #
+  #       logger.info(f"Ордер {order_id} ({symbol} {side} {quantity}) успешно размещен. "
+  #                   f"Цена открытия (приблизительно): {actual_open_price}")
+  #
+  #       if "error" in order_response:
+  #         msg = f"⚠️ Ордер {side} {symbol} НЕ размещен: {result['error']}"
+  #         self.log(msg, level="warning")
+  #         await self.notify(msg)
+  #         return False
+  #
+  #       if "order" in order_response:
+  #         order_data = order_response["order"]
+  #         msg = (
+  #           f"✅ Ордер размещен: {side.upper()} {symbol}\n"
+  #           f"📦 Кол-во: {order_data['amount']}\n"
+  #           f"💵 Цена: {order_data.get('price', 'market')}\n"
+  #           f"🆔 ID: {order_data.get('id')}"
+  #         )
+  #         self.log(msg)
+  #         await self.notify(msg)
+  #
+  #         return True
+  #       self.log(f"⚠️ Неизвестный результат от биржи для {symbol}", level="warning")
+  #
+  #       # 4. Запись информации об открытой сделке в БД
+  #       self.db_manager.add_open_trade(
+  #         symbol=symbol,
+  #         order_id=order_id,
+  #         strategy=strategy_name,
+  #         side=side.lower(),
+  #         open_timestamp=datetime.now(timezone.utc),  # Используем UTC
+  #         open_price=actual_open_price,  # Здесь должна быть фактическая цена исполнения
+  #         quantity=quantity,
+  #         leverage=leverage
+  #       )
+  #       return order_id
+  #     else:
+  #       logger.error(f"Не удалось разместить ордер для {symbol} {side}. Ответ API: {order_response}")
+  #
+  #   except RuntimeError as e:
+  #     if "Недостаточно средств" in str(e):
+  #       msg = f"❌ {symbol} | Ордер не выполнен: Недостаточно средств"
+  #       self.log(msg, level="error")
+  #       await self.notify(msg)
+  #       return False
+  #
+  #
+  #   except Exception as e:
+  #     self.log(f"‼️ Неизвестная ошибка при торговле {symbol}: {e}", level="error")
+  #     await self.notify(f"⚠️ Ошибка при размещении ордера {symbol}: {e}")
+  #     return False
+  #
+  # def log(self, message: str, level="info"):
+  #     logger_method = getattr(self.connector.logger, level, self.connector.logger.info)
+  #     logger_method(message)
+  #
+  # async def notify(self, message: str):
+  #   if self.telegram_bot:
+  #     # try:
+  #       await self.telegram_bot.send_message(message)
+  #     # except Exception as e:
+  #     #   self.connector.logger.warning(f"Ошибка при отправке сообщения в Telegram: {e}")
+  #
+  #
+#-----------------------------------------------------------
   async def close_position(self, symbol: str, db_trade_id: [int] = None, open_order_id: [str] = None,
                            quantity_to_close: [float] = None) -> bool:
     """

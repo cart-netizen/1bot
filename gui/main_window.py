@@ -15,7 +15,7 @@ from datetime import datetime
 from logger_setup import get_logger
 # Импорты других ваших модулей
 from core.bybit_connector import BybitConnector
-from core.database_manager_new import AdvancedDatabaseManager
+from core.database_manager_new import AdvancedDatabaseManager, IntegratedTradingSystem
 # from core.database_manager import DatabaseManager
 from core.trade_executor import TradeExecutor
 from core.data_fetcher import DataFetcher  # Для получения данных для графиков
@@ -34,7 +34,10 @@ class BackendWorker(QObject):
   chart_data_updated = pyqtSignal(str, pd.DataFrame)
   account_balance_history_updated = pyqtSignal(pd.DataFrame)
 
-  def __init__(self, db_manager: AdvancedDatabaseManager):
+  activate_strategy_signal = pyqtSignal(str)
+  deactivate_strategy_signal = pyqtSignal(str)
+
+  def __init__(self, db_manager: AdvancedDatabaseManager, connector, data_fetcher, trade_executor, strategy_instances):
     super().__init__()
     self.db_manager = None
     self.is_running = True
@@ -45,6 +48,8 @@ class BackendWorker(QObject):
     self.data_fetcher = None
     self.trade_executor = None
     self.current_symbol_for_chart = None
+    self.activate_strategy_signal.connect(self.activate_strategy)
+    self.deactivate_strategy_signal.connect(self.deactivate_strategy)
 
   def start_event_loop(self):
     self.db_manager = AdvancedDatabaseManager()
@@ -158,6 +163,20 @@ class BackendWorker(QObject):
     if self.loop and self.loop.is_running():
       self.loop.call_soon_threadsafe(self.loop.stop)
 
+  def activate_strategy(self, strategy_name: str):
+    """Активирует стратегию в торговой системе"""
+    logger.info(f"Worker: Активация стратегии '{strategy_name}'")
+
+    if strategy_name in self.strategy_instances:
+        self.trading_system.add_strategy(self.strategy_instances[strategy_name])
+
+  def deactivate_strategy(self, strategy_name: str):
+    """Деактивирует стратегию в торговой системе"""
+    logger.info(f"Worker: Деактивация стратегии '{strategy_name}'")
+
+    if strategy_name in self.trading_system.active_strategies:
+        self.trading_system.remove_strategy(strategy_name)
+
   def manual_close_position(self, symbol: str):
     """Синхронный метод, вызываемый из GUI, который внутри ставит асинхронную задачу в loop."""
     if not self.loop or not self.loop.is_running():
@@ -226,7 +245,7 @@ class MainWindow(QMainWindow):
     self.strategy_instances = strategy_instances
     # Initialize StrategyManager
 
-
+    self.trading_system = trade_executor.trading_system if trade_executor else None
     self.strategy_manager = StrategyManager(trade_executor)
     # optional: signal callback to log
     self.strategy_manager.set_signal_callback(
@@ -329,6 +348,9 @@ class MainWindow(QMainWindow):
 
     main_splitter.addWidget(left_panel)
 
+
+
+
     # --- Правая панель (графики, таблицы сделок) ---
     right_panel = QWidget()
     right_layout = QVBoxLayout(right_panel)
@@ -387,6 +409,27 @@ class MainWindow(QMainWindow):
     self.balance_chart_widget_pg.showGrid(x=True, y=True, alpha=0.3)
     self.balance_plot_item = self.balance_chart_widget_pg.plot([], [], pen=pg.mkPen('g', width=2),
                                                                name="Динамика Баланса")
+    # 5 Добавляем вкладку для риск-метрик
+    self.risk_metrics_tab = QWidget()
+    risk_layout = QVBoxLayout(self.risk_metrics_tab)
+
+    self.risk_metrics_table = QTableWidget()
+    self.risk_metrics_table.setColumnCount(8)
+    self.risk_metrics_table.setHorizontalHeaderLabels([
+      "Символ", "Просадка", "Макс. просадка",
+      "Win Rate", "Profit Factor", "Sharpe Ratio",
+      "Всего сделок", "Дневной PnL"
+    ])
+    risk_layout.addWidget(self.risk_metrics_table)
+    self.tabs.addTab(self.risk_metrics_tab, "Риск-Метрики")
+
+    # Таймер для обновления риск-метрик
+    self.risk_metrics_timer = QTimer(self)
+    self.risk_metrics_timer.timeout.connect(self.update_risk_metrics_display)
+    self.risk_metrics_timer.start(30000)  # Каждые 30 секунд
+
+
+
     # Настройка оси времени для графика баланса
     axis = pg.DateAxisItem(orientation='bottom')
     self.balance_chart_widget_pg.setAxisItems({'bottom': axis})
@@ -402,24 +445,138 @@ class MainWindow(QMainWindow):
 
     self.add_log_message("GUI инициализирован.")
 
+  def update_risk_metrics_display(self):
+    """Обновляет отображение риск-метрик"""
+    symbols = self.trading_system.active_symbols + [None]  # None - для общих метрик
+
+    self.risk_metrics_table.setRowCount(len(symbols))
+
+    for row, symbol in enumerate(symbols):
+      metrics = self.trading_system.db_manager.get_risk_metrics(symbol)
+
+      self.risk_metrics_table.setItem(row, 0, QTableWidgetItem(symbol or "Все"))
+      self.risk_metrics_table.setItem(row, 1, QTableWidgetItem(f"{metrics.current_drawdown:.2%}"))
+      self.risk_metrics_table.setItem(row, 2, QTableWidgetItem(f"{metrics.max_drawdown:.2%}"))
+      self.risk_metrics_table.setItem(row, 3, QTableWidgetItem(f"{metrics.win_rate:.2%}"))
+      self.risk_metrics_table.setItem(row, 4, QTableWidgetItem(f"{metrics.profit_factor:.2f}"))
+      self.risk_metrics_table.setItem(row, 5, QTableWidgetItem(f"{metrics.sharpe_ratio:.2f}"))
+      self.risk_metrics_table.setItem(row, 6, QTableWidgetItem(str(metrics.total_trades)))
+      self.risk_metrics_table.setItem(row, 7, QTableWidgetItem(f"{metrics.daily_pnl:.2f}"))
+
+  def activate_strategy(self, strategy_name: str):
+    """Активирует выбранную стратегию"""
+    if strategy_name not in self.active_strategies:
+      self.active_strategies.append(strategy_name)
+      logger.info(f"Стратегия '{strategy_name}' активирована")
+
+      # Отправляем команду активации в бэкенд
+      if self.worker:
+        self.worker.activate_strategy(strategy_name)
+
+  def deactivate_strategy(self, strategy_name: str):
+    """Деактивирует выбранную стратегию"""
+    if strategy_name in self.active_strategies:
+      self.active_strategies.remove(strategy_name)
+      logger.info(f"Стратегия '{strategy_name}' деактивирована")
+
+      # Отправляем команду деактивации в бэкенд
+      if self.worker:
+        self.worker.deactivate_strategy(strategy_name)
+
+  def activate_strategy(self, strategy_name: str):
+    self.activate_strategy_signal.emit(strategy_name)
+
+  def deactivate_strategy(self, strategy_name: str):
+    self.deactivate_strategy_signal.emit(strategy_name)
+
   def on_strategy_toggled(self, state):
-    # Called when user toggles strategy enable/disable
+      """Обработчик переключения стратегии"""
+      checkbox = self.sender()
+      if not checkbox:
+        return
+        # Находим позицию чекбокса в таблице
+      for row in range(self.strategy_table.rowCount()):
+          for col in range(self.strategy_table.columnCount()):
+            if self.strategy_table.cellWidget(row, col) == checkbox:
+              # Получаем название стратегии из первого столбца
+              strategy_name_item = self.strategy_table.item(row, 0)
+              if strategy_name_item:
+                strategy_name = strategy_name_item.text()
 
-    sender = self.sender()
-    strat_name = sender.text()
-    enabled = sender.isChecked()
-    # Update StrategyManager
-    symbols = self.get_monitored_symbols()
-
-    for symbol in symbols:
-
-      if enabled:
-        strat = self.strategy_instances[strat_name]
-      self.strategy_manager.register_strategy(symbol, strat)
-    else:
-      self.strategy_manager.unregister_strategy(symbol, strat_name)
+                if state == Qt.CheckState.Checked.value:
+                  print(f"Активация стратегии: {strategy_name}")
+                  self.activate_strategy(strategy_name)
+                else:
+                  print(f"Деактивация стратегии: {strategy_name}")
+                  self.deactivate_strategy(strategy_name)
+              return
 
 
+      # try:
+      #   if item.column() != 1:  # Проверяем что это колонка с чекбоксом
+      #     return
+      #
+      #   symbol = item.data(Qt.UserRole)
+      #   is_checked = item.checkState() == Qt.Checked
+      #
+      #   if is_checked:
+      #     # Получаем стратегию для активации
+      #     selected_strategy = self._get_strategy_for_symbol(symbol)
+      #
+      #     if selected_strategy:
+      #       self.strategy_manager.register_strategy(symbol, selected_strategy)
+      #       print(f"Стратегия '{selected_strategy.__class__.__name__}' активирована для {symbol}")
+      #     else:
+      #       print(f"Не удалось найти подходящую стратегию для {symbol}")
+      #       # Снимаем галочку если стратегия не найдена
+      #       item.setCheckState(Qt.Unchecked)
+      #   else:
+      #     # Деактивируем стратегию
+      #     self.strategy_manager.unregister_strategy(symbol)
+      #     print(f"Стратегия деактивирована для {symbol}")
+      #
+      # except Exception as e:
+      #   print(f"Ошибка при переключении стратегии: {e}")
+
+  def _get_strategy_for_symbol(self, symbol: str):
+    """Получить стратегию для символа"""
+    try:
+      # Приоритет 1: Проверяем специфичные стратегии для символа
+      if hasattr(self, 'strategy_instances') and self.strategy_instances:
+        # Ищем стратегию специально для этого символа
+        for strategy_name, strategy_instance in self.strategy_instances.items():
+          if symbol.lower() in strategy_name.lower():
+            return strategy_instance
+
+        # Если нет специфичной стратегии, берем первую доступную
+        return list(self.strategy_instances.values())[0]
+
+      # Приоритет 2: Используем интегрированную торговую систему
+      if hasattr(self, 'trade_executor') and hasattr(self.trade_executor, 'trading_system'):
+        return self.trade_executor.trading_system
+
+      # Приоритет 3: Создаем новую интегрированную систему если есть db_manager
+      if hasattr(self, 'db_manager'):
+
+        return IntegratedTradingSystem(db_manager=self.db_manager)
+
+      return None
+
+    except Exception as e:
+      print(f"Ошибка при получении стратегии для {symbol}: {e}")
+      return None
+
+  def _get_available_strategy(self):
+    """Получить доступную стратегию"""
+    # Проверяем strategy_instances
+    if hasattr(self, 'strategy_instances') and self.strategy_instances:
+      return list(self.strategy_instances.values())[0]
+
+    # Проверяем trade_executor
+    if hasattr(self, 'trade_executor') and hasattr(self.trade_executor, 'trading_system'):
+      return self.trade_executor.trading_system
+
+    return None
 
   def load_initial_data(self):
     """Загружает начальные данные при запуске GUI."""
