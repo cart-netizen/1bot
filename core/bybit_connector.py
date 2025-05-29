@@ -454,6 +454,23 @@ class BybitConnector:
           logger.error(f"Ошибка при установке кредитного плеча для {symbol}: {e}")
           raise
 
+  async def fetch_order_book(self, symbol: str, depth: int = 25) -> Dict[str, List]:
+    """Получает стакан ордеров с биржи"""
+    try:
+      if not self.exchange:
+        logger.error("CCXT exchange не инициализирован")
+        return {'bids': [], 'asks': []}
+
+      orderbook = await self.exchange.fetch_order_book(symbol, limit=depth)
+      return {
+        'bids': [[price, amount] for price, amount in orderbook['bids']],
+        'asks': [[price, amount] for price, amount in orderbook['asks']]
+      }
+    except Exception as e:
+      logger.error(f"Ошибка получения стакана для {symbol}: {e}")
+      return {'bids': [], 'asks': []}
+
+
   async def get_kline(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
     """
     Получение исторических свечей (k-lines).

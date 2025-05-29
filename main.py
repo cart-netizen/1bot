@@ -12,7 +12,7 @@ import config  # Загрузка конфигурации
 from core.bybit_connector import BybitConnector
 from core.data_fetcher import DataFetcher
 from core.database_manager_new import AdvancedDatabaseManager
-from core.database_manager import DatabaseManager
+# from core.database_manager import DatabaseManager
 from core.trade_executor import TradeExecutor
 from core.monitoring_service import MonitoringService
 from ml_models.lorentzian_classifier import LorentzianClassifier  # и его обучение/загрузка
@@ -36,7 +36,7 @@ strategy_tasks: Dict[str, asyncio.Task] = {}  # Задачи для каждой
 # Эти объекты будут создаваться в main_async
 bybit_connector:[BybitConnector] = None
 data_fetcher:[DataFetcher] = None
-db_manager:[DatabaseManager] = None
+db_manager:[AdvancedDatabaseManager] = None
 trade_executor:[TradeExecutor] = None
 ml_model:[LorentzianClassifier] = None
 # Словарь стратегий {name: instance}
@@ -192,7 +192,7 @@ async def main_async():
   await bybit_connector.init_session()  # Инициализация HTTP сессии
 
   data_fetcher = DataFetcher(bybit_connector)
-  db_manager = DatabaseManager(db_path=config.DATABASE_PATH)
+  db_manager = AdvancedDatabaseManager(db_path=config.DATABASE_PATH)
   trade_executor = TradeExecutor(bybit_connector, db_manager)
   # telegram_bot = TelegramBotNotifier(token=TELEGRAM_TOKEN, chat_id=TELEGRAM_CHAT_ID)
   # trade_executor = TradeExecutor(connector=bybit_connector, db_manager=db_manager, telegram_bot=telegram_bot)
@@ -354,7 +354,7 @@ if __name__ == "__main__":
   # await temp_connector.init_session() # НЕЛЬЗЯ await здесь, т.к. это синхронная часть __main__
   # Инициализацию сессии нужно будет сделать в async части или при запуске worker'а GUI
 
-  temp_db_manager = DatabaseManager(db_path=config.DATABASE_PATH)  # DB manager синхронный
+  temp_db_manager = AdvancedDatabaseManager(db_path=config.DATABASE_PATH)  # DB manager синхронный
   # temp_data_fetcher создастся внутри main_async или будет передан из него
 
   # --- Запуск PyQt GUI ---

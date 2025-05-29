@@ -16,7 +16,7 @@ from logger_setup import get_logger
 # Импорты других ваших модулей
 from core.bybit_connector import BybitConnector
 from core.database_manager_new import AdvancedDatabaseManager
-from core.database_manager import DatabaseManager
+# from core.database_manager import DatabaseManager
 from core.trade_executor import TradeExecutor
 from core.data_fetcher import DataFetcher  # Для получения данных для графиков
 from config import LEVERAGE, API_KEY, API_SECRET
@@ -34,7 +34,7 @@ class BackendWorker(QObject):
   chart_data_updated = pyqtSignal(str, pd.DataFrame)
   account_balance_history_updated = pyqtSignal(pd.DataFrame)
 
-  def __init__(self, db_manager: DatabaseManager):
+  def __init__(self, db_manager: AdvancedDatabaseManager):
     super().__init__()
     self.db_manager = None
     self.is_running = True
@@ -47,7 +47,7 @@ class BackendWorker(QObject):
     self.current_symbol_for_chart = None
 
   def start_event_loop(self):
-    self.db_manager = DatabaseManager()
+    self.db_manager = AdvancedDatabaseManager()
     self.loop = asyncio.new_event_loop()
     asyncio.set_event_loop(self.loop)
 
@@ -176,7 +176,7 @@ class BackendWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-  def __init__(self, connector: BybitConnector, db_manager: DatabaseManager, data_fetcher: DataFetcher,
+  def __init__(self, connector: BybitConnector, db_manager: AdvancedDatabaseManager, data_fetcher: DataFetcher,
                trade_executor: TradeExecutor,
                monitoring_service_getter: object,  #: Callable[[], List[str]],
                strategy_instances: object) -> object:   #: Dict[str, BaseStrategy]):  # Добавили стратегии

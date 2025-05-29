@@ -13,6 +13,10 @@ class DataFetcher:
   def __init__(self, connector: BybitConnector):
     self.connector = connector
 
+  async def fetch_order_book(self, symbol: str, depth: int = 25) -> Dict[str, List]:
+    """Получает стакан ордеров через connector"""
+    return await self.connector.fetch_order_book(symbol, depth)
+
   async def get_all_usdt_perpetual_symbols(self) -> List[str]:
     """
     Получает список всех торгующихся USDT бессрочных контрактов.

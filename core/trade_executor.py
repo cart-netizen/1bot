@@ -4,7 +4,7 @@ import ccxt
 
 from core.bybit_connector import BybitConnector
 from core.database_manager_new import AdvancedDatabaseManager
-from core.database_manager import DatabaseManager
+# from core.database_manager import DatabaseManager
 from logger_setup import get_logger
 from config import LEVERAGE  # Глобальное плечо по умолчанию
 
@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 
 
 class TradeExecutor:
-  def __init__(self, connector: BybitConnector, db_manager: DatabaseManager, telegram_bot=None):
+  def __init__(self, connector: BybitConnector, db_manager: AdvancedDatabaseManager, telegram_bot=None):
     self.connector = connector
     self.db_manager = db_manager
     self.telegram_bot = telegram_bot
